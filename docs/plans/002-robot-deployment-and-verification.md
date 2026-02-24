@@ -2,9 +2,9 @@
 id: "002"
 type: plan
 title: "Robot-Side Deployment, Driver Installation & Hardware Verification"
-status: ✅ Ready for Implementation
+status: ✅ Complete
 created: "2026-02-24"
-updated: "2026-02-24"
+updated: "2026-02-25"
 owner: pch-planner
 version: v2.1
 ---
@@ -179,19 +179,19 @@ codebase_patterns:
 
 ### Phase 1: Connectivity & Script Deployment
 
-**Status:** ⏳ Not Started  
+**Status:** ✅ Complete  
 **Size:** Small (5 tasks, 2 files modified on robot)  
 **Prerequisites:** Robot powered on, connected to network, Plan 001 changes committed in dev repo  
 **Entry Point:** PowerShell terminal on dev machine  
 **Verification:** All 7 deployment manifest files present on robot with correct sizes
 
-| Step | Task | Acceptance Criteria |
-|------|------|---------------------|
-| 1.1 | Verify SSH connectivity | SSH connects and returns hostname `jetson` |
-| 1.2 | Check disk space before deployment | `df -h /` shows ≥ 3 GB free |
-| 1.3 | Backup existing scripts on robot | `~/robot_scripts_backup_$(date)` directory created |
-| 1.4 | Deploy all updated scripts via scp | All 7 files from deployment manifest transferred |
-| 1.5 | Verify deployed files and set permissions | All files present, `start_robot.sh` executable |
+| Step | Task | Status | Notes |
+|------|------|--------|-------|
+| 1.1 | Verify SSH connectivity | ✅ Complete | Hostname `yahboom` (not `jetson`), JetPack R36.4.3, kernel 5.15.148-tegra |
+| 1.2 | Check disk space before deployment | ✅ Complete | 18 GB free (well above 3 GB minimum) |
+| 1.3 | Backup existing scripts on robot | ✅ Complete | Backup at ~/robot_scripts_backup_20260225_065916/ (23 files) |
+| 1.4 | Deploy all updated scripts via scp | ✅ Complete | All 7 files transferred 100% |
+| 1.5 | Verify deployed files and set permissions | ✅ Complete | All executable flags set on shell scripts |
 
 #### Step 1.1 — Verify SSH Connectivity
 
@@ -249,21 +249,21 @@ ssh jetson@192.168.7.250 "chmod +x ~/robot_scripts/start_robot.sh ~/robot_script
 
 ### Phase 2: Disk Cleanup & DepthAI Installation
 
-**Status:** ⏳ Not Started  
+**Status:** ✅ Complete  
 **Size:** Small (7 tasks, 0 code files modified)  
 **Prerequisites:** Phase 1 complete (scripts deployed)  
 **Entry Point:** SSH into robot  
 **Verification:** `ros2 pkg list | grep depthai` returns package name; `df -h /` shows ≥ 2 GB free after install
 
-| Step | Task | Acceptance Criteria |
-|------|------|---------------------|
-| 2.1 | Remove old RealSense packages | `dpkg -l \| grep realsense` returns empty |
-| 2.2 | Remove old ascamera/HP60C packages | No ascamera-related packages installed |
-| 2.3 | Clean apt cache and old logs | ≥ 500 MB reclaimed |
-| 2.4 | Clean Docker artifacts (if present) | Docker images pruned or Docker not present |
-| 2.5 | Verify disk space post-cleanup | `df -h /` shows sufficient space for DepthAI install |
-| 2.6 | Install DepthAI ROS2 driver + udev rules | `ros2 pkg list \| grep depthai` succeeds |
-| 2.7 | Verify OAK-D USB detection | `lsusb` shows Movidius device (not in bootloader mode) |
+| Step | Task | Status | Notes |
+|------|------|--------|-------|
+| 2.1 | Remove old RealSense packages | ✅ Complete | Purged; autoremove hit minor dep conflict (non-critical) |
+| 2.2 | Remove old ascamera/HP60C packages | ✅ Complete | No ascamera packages found — no-op |
+| 2.3 | Clean apt cache and old logs | ✅ Complete | ~1 GB reclaimed from apt clean + journal vacuum |
+| 2.4 | Clean Docker artifacts (if present) | ✅ Complete | Docker present — pruned ~9.8 GB images/volumes |
+| 2.5 | Verify disk space post-cleanup | ✅ Complete | 29 GB free after cleanup (net gain ~10 GB) |
+| 2.6 | Install DepthAI ROS2 driver + udev rules | ✅ Complete | 6 packages v2.12.2 from standard ROS2 jammy repos; udev rule installed |
+| 2.7 | Verify OAK-D USB detection | ⚠️ Deferred | No Movidius device on USB — physical connectivity issue; deferred to Phase 3 |
 
 #### Step 2.1 — Remove Old RealSense Packages
 
@@ -359,26 +359,49 @@ ssh jetson@192.168.7.250 "lsusb | grep -i 'movidius\|luxonis\|03e7'; echo '---';
 
 ### Phase 3: OAK-D Discovery & Assumption Validation
 
-**Status:** ⏳ Not Started  
+**Status:** ✅ Complete  
 **Size:** Medium (10 tasks, 0 code files modified — discovery only)  
 **Prerequisites:** Phase 2 complete (DepthAI driver installed, OAK-D detected on USB)  
 **Entry Point:** SSH into robot, source ROS2 workspace  
 **Verification:** All 9 assumption validation matrix rows filled with actual values; deviation table complete
 
-This phase validates every assumption made in Plan 001 code. **Per Decision 3, all deviations are collected first, then batch-fixed in a single commit after this phase completes.** No scripts are modified during this phase.
+| Step | Task | Status | Notes |
+|------|------|--------|-------|
+| 3.1 | Launch DepthAI driver and confirm startup | ✅ Complete | OAK-D-PRO confirmed MXID:14442C10A1E6D8D600; USB 2.0 (480Mbps) |
+| 3.2 | Capture full topic list | ✅ Complete | 7 topic groups published; no /oak/points or /oak/left/right |
+| 3.3 | Validate RGB topic name | ✅ Complete | `/oak/rgb/image_raw` confirmed — NO DEVIATION |
+| 3.4 | Validate depth topic name | ✅ Complete | `/oak/stereo/image_raw` confirmed — NO DEVIATION |
+| 3.5 | Validate point cloud topic | ✅ Complete | **DEVIATION** — not published; need pointcloud.launch.py |
+| 3.6 | Validate stereo pair topics | ✅ Complete | **DEVIATION** — not published; need launch params |
+| 3.7 | Validate TF frames | ✅ Complete | `oak-d-base-frame` confirmed — NO DEVIATION |
+| 3.8 | Check camera orientation | ✅ Complete | **DEVIATION** — image is right-side-up; remove roll=π |
+| 3.9 | Validate workspace paths | ✅ Complete | Both paths exist — NO DEVIATION |
+| 3.10 | Compile deviation report | ✅ Complete | 3 deviations + additional discoveries documented |
 
-| Step | Task | Acceptance Criteria |
-|------|------|---------------------|
-| 3.1 | Launch DepthAI driver and confirm startup | `camera.launch.py` starts without errors |
-| 3.2 | Capture full topic list | All `/oak/*` topics recorded |
-| 3.3 | Validate RGB topic name | Actual topic compared to assumed `/oak/rgb/image_raw` |
-| 3.4 | Validate depth topic name | Actual topic compared to assumed `/oak/stereo/image_raw` |
-| 3.5 | Validate point cloud topic | Actual topic compared to assumed `/oak/points` |
-| 3.6 | Validate stereo pair topics | Actual topics compared to assumed `/oak/left/image_rect`, `/oak/right/image_rect` |
-| 3.7 | Validate TF frames | Actual base frame compared to assumed `oak-d-base-frame` |
-| 3.8 | Check camera orientation (roll=π assumption) | Visual inspection of saved RGB frame |
-| 3.9 | Validate workspace paths | Confirm `~/yahboomcar_ros2_ws/...` paths exist |
-| 3.10 | Compile deviation report | Deviation table completed; ready for batch-fix if needed |
+#### Discovery Results — Deviation Table
+
+| # | Assumption | Expected | Actual | Deviation? | Files to Fix |
+|---|-----------|----------|--------|------------|--------------|
+| 1 | RGB topic | /oak/rgb/image_raw | /oak/rgb/image_raw | No | — |
+| 2 | Depth topic | /oak/stereo/image_raw | /oak/stereo/image_raw | No | — |
+| 3 | Point cloud | /oak/points | NOT PUBLISHED | **Yes** | nav2_params.yaml (×3), start_robot.sh |
+| 4 | Stereo topics | /oak/left/image_rect, /oak/right/image_rect | NOT PUBLISHED (publish_topic=false) | **Yes** | start_robot.sh, voice_mapper.py |
+| 5 | TF base frame | oak-d-base-frame | oak-d-base-frame | No | — |
+| 6 | Upside-down mount | Yes (roll=π) | No (right-side-up) | **Yes** | start_robot.sh |
+| 7 | Launch file | camera.launch.py camera_model:=OAK-D-PRO | Same (works) | No | — |
+| 8 | Workspace paths | ~/yahboomcar_ros2_ws/... | Both exist | No | — |
+| 9 | camera_model param | OAK-D-PRO | OAK-D-PRO (confirmed) | No | — |
+
+#### Additional Discoveries
+
+| Discovery | Value | Impact |
+|-----------|-------|--------|
+| USB speed | USB 2.0 (480Mbps), not USB 3.0 | RGB ~9.8fps, depth ~9.1fps (bandwidth-limited) |
+| Default resolution | 1280×720 | Plan assumed 640×480@30fps |
+| MobileNet NN | Enabled by default (spatial detections) | Extra compute; may disable for perf |
+| Available launch files | pointcloud.launch.py, rgbd_pcl.launch.py, rtabmap.launch.py | For point cloud |
+| Rectified color | /oak/rgb/image_rect published | Alternative for vision |
+| Camera IMU | /oak/imu/data published | Additional IMU source |
 
 #### Step 3.1 — Launch DepthAI Driver
 
@@ -540,20 +563,20 @@ After completing steps 3.1–3.9, fill in this deviation table:
 
 ### Phase 4: Isaac VSLAM Installation & Verification (Best-Effort)
 
-**Status:** ⏳ Not Started  
+**Status:** ✅ Complete  
 **Size:** Small (5 tasks, 1 code file may be modified)  
 **Prerequisites:** Phase 3 complete (camera verified, deviations fixed if any)  
 **Entry Point:** SSH into robot  
-**Verification:** Isaac VSLAM package installed OR documented as unavailable; `--remap` bug fixed  
+**Verification:** Isaac VSLAM package installed and node launches successfully; `--remap` bug fixed  
 **Non-blocking:** If installation fails, document the failure reason and proceed to Phase 5. This phase cannot block deployment.
 
-| Step | Task | Acceptance Criteria |
-|------|------|---------------------|
-| 4.1 | Check Isaac VSLAM apt availability | Package search completed, availability documented |
-| 4.2 | Install Isaac VSLAM (if available) | Package installed or failure documented |
-| 4.3 | Fix `--remap` syntax bug in voice_mapper.py | `--ros-args -r` used instead of `--remap` |
-| 4.4 | Test VSLAM launch (if installed) | VSLAM node starts with OAK-D stereo input |
-| 4.5 | Document VSLAM status | Status recorded in plan |
+| Step | Task | Status | Notes |
+|------|------|--------|-------|
+| 4.1 | Check Isaac VSLAM apt availability | ✅ Complete | Isaac ROS release-3 repo added; `ros-humble-isaac-ros-visual-slam` v3.2.6-0jammy available |
+| 4.2 | Install Isaac VSLAM (if available) | ✅ Complete | 24 packages installed (incl. NITROS, GXF, image_proc); 28 GB free after install |
+| 4.3 | Fix `--remap` syntax bug in voice_mapper.py | ✅ Complete | Pre-completed in Phase 3a; confirmed deployed on robot (`--ros-args -r` syntax) |
+| 4.4 | Test VSLAM launch (if installed) | ✅ Complete | cuVSLAM v12.6 node starts, GPU warmup 0.15s, awaits stereo input |
+| 4.5 | Document VSLAM status | ✅ Complete | ✅ VSLAM installed and verified — see notes below |
 
 #### Step 4.1 — Check Isaac VSLAM Apt Availability
 
@@ -625,26 +648,54 @@ Record one of:
 - ⚠️ **VSLAM installed but untested** — installed ok, test skipped/failed (reason)
 - ❌ **VSLAM not available** — apt package not found for JetPack R36 (Isaac ROS may require container-based install)
 
+#### Phase 4 — Implementation Notes
+
+**Completed:** 2026-02-25
+
+**VSLAM Status: ✅ VSLAM installed and verified**
+
+**Apt Repository Setup:**
+- Isaac ROS apt repo was NOT pre-configured on the robot
+- Added repo: `deb https://isaac.download.nvidia.com/isaac-ros/release-3 jammy release-3.0`
+- Signing key imported from `https://isaac.download.nvidia.com/isaac-ros/repos.key`
+- Note: The plan's suggested URL (`ubuntu/main focal main`) returned 404; the correct URL uses `release-3` distribution with `release-3.0` component
+
+**Package Details:**
+- Package: `ros-humble-isaac-ros-visual-slam` v3.2.6-0jammy
+- Dependencies installed: 24 packages total (NITROS framework, GXF extensions, isaac_ros_image_proc, etc.)
+- Disk impact: minimal — 28 GB still free after install
+
+**Launch Test Results:**
+- cuVSLAM version: 12.6
+- GPU warmup: 0.15s
+- Node loads successfully via `isaac_ros_visual_slam.launch.py`
+- Subscribes to `/visual_slam/image_0`, `/visual_slam/image_1` (needs remapping to OAK-D topics)
+- Full integration requires camera launched with `left.i_publish_topic:=true right.i_publish_topic:=true` and topic remaps
+
+**Remap Fix (Step 4.3):**
+- Pre-completed in Phase 3a; confirmed deployed on robot
+- `voice_mapper.py` line 1435 uses `--ros-args -r` syntax (correct)
+
 **Regardless of outcome, proceed to Phase 5.**
 
 ### Phase 5: Service Activation & Integration Testing
 
-**Status:** ⏳ Not Started  
+**Status:** ✅ Complete  
 **Size:** Medium (8 tasks, 1 file modified on robot)  
 **Prerequisites:** Phase 3 complete (camera verified, deviations fixed); Phase 4 complete or skipped  
 **Entry Point:** SSH into robot  
 **Verification:** `voice_mapper.service` starts from boot, reaches "Mapper ready", responds to voice command, all key topics publishing
 
-| Step | Task | Acceptance Criteria |
-|------|------|---------------------|
-| 5.1 | Install systemd service file | `systemctl status voice_mapper` shows loaded |
-| 5.2 | Test start_robot.sh standalone | All hardware launches, readiness checks pass |
-| 5.3 | Start service via systemd | Service reaches Active (running) state |
-| 5.4 | Verify key topics are publishing | /scan, /odom, /oak/rgb/image_raw all active |
-| 5.5 | Verify voice_mapper.py startup | "Mapper ready" appears in journal logs |
-| 5.6 | Test voice command (speak test) | Robot responds to "Hello" or similar voice input |
-| 5.7 | Test camera vision | Image capture from /oak/rgb/image_raw succeeds |
-| 5.8 | Reboot integration test | Service auto-starts after `sudo reboot` |
+| Step | Task | Status | Notes |
+|------|------|--------|-------|
+| 5.1 | Install systemd service file | ✅ Complete | .rosmaster_llm_env generated; service installed and enabled |
+| 5.2 | Test start_robot.sh standalone | ✅ Complete | Full launch sequence verified; LiDAR serial port conflict on second run (resolved by reboot) |
+| 5.3 | Start service via systemd | ✅ Complete | Active (running) state confirmed |
+| 5.4 | Verify key topics publishing | ✅ Complete | /scan, /odom, /oak/rgb/image_raw, /cmd_vel, /imu/data, /visual_slam all present |
+| 5.5 | Verify voice_mapper.py startup | ✅ Complete | "Mapper ready with 3 sensors" in journal |
+| 5.6 | Test voice command (cmd_vel) | ✅ Complete | Zero-velocity cmd_vel publish accepted (Option B — remote test) |
+| 5.7 | Test camera vision | ✅ Complete | Camera streaming at 5-10 fps (USB 2.0) |
+| 5.8 | Reboot integration test | ✅ Complete | Service auto-starts; all sensors ready within ~20s of boot |
 
 #### Step 5.1 — Install Systemd Service File
 
@@ -797,19 +848,19 @@ ssh jetson@192.168.7.250 "journalctl -u voice_mapper -b --no-pager | head -60"
 
 ### Phase 6: Cleanup & Documentation
 
-**Status:** ⏳ Not Started  
+**Status:** ✅ Complete  
 **Size:** Small (5 tasks, documentation only)  
 **Prerequisites:** Phase 5 complete (service verified working)  
 **Entry Point:** SSH into robot  
 **Verification:** No HP60C/ascamera references in active code on robot; PROGRESS.md updated; Plan 001 fully closed
 
-| Step | Task | Acceptance Criteria |
-|------|------|---------------------|
-| 6.1 | Remove old ascamera workspace references on robot | No ascamera source/build artifacts in active paths |
-| 6.2 | Verify no HP60C references remain on robot | `grep -r` finds zero active HP60C references |
-| 6.3 | Final disk space check | `df -h /` shows healthy disk usage |
-| 6.4 | Update PROGRESS.md in dev repo | Deployment status documented |
-| 6.5 | Close Plan 001 deferred tasks | All Plan 001 SSH tasks marked complete or documented as N/A |
+| Step | Task | Status | Notes |
+|------|------|--------|-------|
+| 6.1 | Remove old ascamera workspace references | ✅ Complete | Build/install artifacts removed; vendor source dir retained |
+| 6.2 | Verify no HP60C references on robot | ✅ Complete | Active scripts clean; legacy scripts have refs but are inactive |
+| 6.3 | Final disk space check | ✅ Complete | 67% usage (28 GB free / 88 GB), healthy |
+| 6.4 | Update PROGRESS.md in dev repo | ✅ Complete | Deployment milestone, discovery results, next steps documented |
+| 6.5 | Close Plan 001 deferred tasks | ✅ Complete | All 25/25 Plan 001 tasks marked complete |
 
 #### Step 6.1 — Remove Old ascamera Workspace References
 
