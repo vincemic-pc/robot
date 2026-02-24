@@ -1,8 +1,8 @@
 #!/bin/bash
 #===============================================================================
 # ROSMASTER A1 - 3D Depth Camera Setup Script
-# Sets up the Nuwa/Astra depth camera for the robot
-# Supports: Nuwa depth camera, Astra Pro, Realsense cameras
+# Sets up depth cameras for the robot
+# Supports: OAK-D Pro, Nuwa depth camera, Astra Pro, Realsense cameras
 #===============================================================================
 
 set -e
@@ -14,8 +14,8 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# Camera type (nuwa, astra, realsense)
-CAMERA_TYPE="${CAMERA_TYPE:-nuwa}"
+# Camera type (oakd, nuwa, astra, realsense)
+CAMERA_TYPE="${CAMERA_TYPE:-oakd}"
 
 print_header() {
     echo -e "${BLUE}"
@@ -88,6 +88,19 @@ check_camera_connection() {
                 return 1
             fi
             ;;
+        oakd)
+            # Check for Luxonis OAK-D (Movidius VPU, USB vendor ID 03e7)
+            if lsusb | grep -qi "03e7"; then
+                print_info "OAK-D camera detected (Movidius VPU)!"
+                lsusb | grep -i "03e7" || true
+                return 0
+            else
+                print_warning "No OAK-D camera detected (Movidius USB ID 03e7)"
+                print_info "Available USB devices:"
+                lsusb
+                return 1
+            fi
+            ;;
     esac
 }
 
@@ -124,6 +137,15 @@ install_camera_deps() {
                 ros-humble-realsense2-camera \
                 ros-humble-realsense2-description
             ;;
+        oakd)
+            print_info "Installing OAK-D (DepthAI) camera packages..."
+            sudo apt-get install -y \
+                ros-humble-depthai-ros-driver \
+                ros-humble-depthai-bridge \
+                ros-humble-depthai-descriptions 2>/dev/null || true
+            # Setup udev rules for Luxonis cameras
+            setup_oakd_udev
+            ;;
     esac
     
     print_info "Camera dependencies installed!"
@@ -153,6 +175,26 @@ EOF
     print_info "Udev rules configured!"
 }
 
+# Setup udev rules for Luxonis OAK-D cameras
+setup_oakd_udev() {
+    print_info "Setting up udev rules for Luxonis OAK-D cameras..."
+    
+    # Create udev rules for Luxonis/Movidius VPU
+    sudo tee /etc/udev/rules.d/80-movidius.rules > /dev/null << 'EOF'
+# Luxonis OAK-D cameras (Movidius VPU)
+SUBSYSTEM=="usb", ATTR{idVendor}=="03e7", MODE="0666", GROUP="plugdev"
+EOF
+    
+    # Reload udev rules
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger
+    
+    # Add user to plugdev group
+    sudo usermod -aG plugdev $USER
+    
+    print_info "OAK-D udev rules configured!"
+}
+
 # Launch depth camera node
 launch_depth_camera() {
     print_info "Launching depth camera..."
@@ -178,6 +220,12 @@ launch_depth_camera() {
                 depth_module.profile:=640x480x30 \
                 rgb_camera.profile:=640x480x30 \
                 align_depth.enable:=true &
+            ;;
+        oakd)
+            # Launch OAK-D camera via depthai-ros
+            ros2 launch depthai_ros_driver camera.launch.py \
+                camera_model:=OAK-D-PRO \
+                enableRviz:=false &
             ;;
     esac
     
@@ -249,10 +297,29 @@ view_camera_rviz() {
     
     source_ros2
     
+    # Set topics based on camera type
+    case ${CAMERA_TYPE} in
+        oakd)
+            COLOR_TOPIC="/oak/rgb/image_raw"
+            DEPTH_TOPIC="/oak/stereo/image_raw"
+            POINTS_TOPIC="/oak/points"
+            ;;
+        realsense)
+            COLOR_TOPIC="/camera/color/image_raw"
+            DEPTH_TOPIC="/camera/depth/image_rect_raw"
+            POINTS_TOPIC="/camera/depth/color/points"
+            ;;
+        *)
+            COLOR_TOPIC="/camera/color/image_raw"
+            DEPTH_TOPIC="/camera/depth/image_raw"
+            POINTS_TOPIC="/camera/depth/points"
+            ;;
+    esac
+    
     # Create RViz config for camera
     RVIZ_CONFIG="/tmp/camera_view.rviz"
     
-    cat > ${RVIZ_CONFIG} << 'EOF'
+    cat > ${RVIZ_CONFIG} << EOF
 Panels:
   - Class: rviz_common/Displays
     Name: Displays
@@ -261,17 +328,17 @@ Visualization Manager:
     - Class: rviz_default_plugins/Image
       Name: Color Image
       Topic:
-        Value: /camera/color/image_raw
+        Value: ${COLOR_TOPIC}
       Transport Hint: raw
     - Class: rviz_default_plugins/Image
       Name: Depth Image
       Topic:
-        Value: /camera/depth/image_raw
+        Value: ${DEPTH_TOPIC}
       Transport Hint: raw
     - Class: rviz_default_plugins/PointCloud2
       Name: PointCloud
       Topic:
-        Value: /camera/depth/points
+        Value: ${POINTS_TOPIC}
       Size (m): 0.01
   Global Options:
     Fixed Frame: camera_link
@@ -309,7 +376,7 @@ show_usage() {
     echo "  help        Show this help message"
     echo ""
     echo "Environment variables:"
-    echo "  CAMERA_TYPE  Camera type: nuwa, astra, realsense (default: nuwa)"
+    echo "  CAMERA_TYPE  Camera type: oakd, nuwa, astra, realsense (default: oakd)"
 }
 
 # Main execution

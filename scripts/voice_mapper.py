@@ -6,7 +6,7 @@ Combines:
 - Whisper STT + GPT-4o Brain/Vision + TTS
 - LiDAR Navigation (slam_toolbox)
 - Isaac VSLAM with OAK-D Pro (when available)
-- Camera abstraction: HP60C / OAK-D Pro / RealSense
+- Camera abstraction: OAK-D Pro / RealSense
 
 SLAM Modes:
 - 'lidar': slam_toolbox with LiDAR (default, works with any camera)
@@ -70,7 +70,6 @@ except ImportError:
 
 class CameraType(Enum):
     """Supported camera types"""
-    HP60C = "hp60c"      # Yahboom HP60C (USB 2.0, limited)
     OAK_D_PRO = "oakd"   # Luxonis OAK-D Pro (USB 3.0, VSLAM-ready)
     REALSENSE = "realsense"  # Intel RealSense D435i
     
@@ -93,17 +92,11 @@ class CameraConfig:
     camera_info_left: str = ""
     camera_info_right: str = ""
     imu_topic: str = ""       # For VIO
-    needs_enhancement: bool = False  # HP60C needs brightness boost
+    needs_enhancement: bool = False  # Some cameras need brightness boost
     
 
 # Pre-defined camera configurations
 CAMERA_CONFIGS = {
-    CameraType.HP60C: CameraConfig(
-        camera_type=CameraType.HP60C,
-        rgb_topic="/ascamera_hp60c/camera_publisher/rgb0/image",
-        depth_topic="/ascamera_hp60c/camera_publisher/depth0/image",
-        needs_enhancement=True,  # Dark images need enhancement
-    ),
     CameraType.OAK_D_PRO: CameraConfig(
         camera_type=CameraType.OAK_D_PRO,
         rgb_topic="/oak/rgb/image_raw",
@@ -1150,11 +1143,11 @@ Always respond with valid JSON. Keep speech short (1-2 sentences)."""
             if len(valid_depths) == 0:
                 result = {'distance': -1.0, 'valid': False, 'x': x, 'y': y}
             else:
-                # HP60C depth is in millimeters, convert to meters
+                # Depth is in millimeters, convert to meters
                 depth_mm = float(np.median(valid_depths))
                 depth_m = depth_mm / 1000.0
                 
-                # Validate range (HP60C range is 0.2m - 8m)
+                # Validate range (typical depth camera range)
                 if 0.1 < depth_m < 10.0:
                     result = {'distance': depth_m, 'valid': True, 'x': x, 'y': y}
                     self.get_logger().info(f"📏 Depth at ({x},{y}): {depth_m:.2f}m")
@@ -1396,12 +1389,7 @@ If the object is not visible, set found to false. Only respond with valid JSON."
             self.get_logger().warning("Isaac VSLAM already running")
             return True
         
-        # Check camera compatibility
-        if self.camera_type == CameraType.HP60C:
-            self.get_logger().error("❌ HP60C not suitable for VSLAM - use OAK-D Pro or RealSense")
-            self.speak("Current camera is not compatible with visual slam. Need OAK-D Pro.")
-            return False
-        
+        # Check camera compatibility - need stereo topics for VSLAM
         if not self.camera_config.left_topic:
             self.get_logger().error("❌ No stereo camera configured for VSLAM")
             return False
@@ -1622,14 +1610,9 @@ If the object is not visible, set found to false. Only respond with valid JSON."
             self.get_logger().info("📷 Detected: Intel RealSense")
             return CameraType.REALSENSE
         
-        # Check for HP60C topics
-        if "/ascamera_hp60c" in str(topic_names):
-            self.get_logger().info("📷 Detected: Angstrong HP60C")
-            return CameraType.HP60C
-        
-        # Default to HP60C (current robot camera)
-        self.get_logger().info("📷 Defaulting to HP60C (no other camera detected)")
-        return CameraType.HP60C
+        # Default to OAK-D Pro (primary robot camera)
+        self.get_logger().info("📷 Defaulting to OAK-D Pro (no other camera detected)")
+        return CameraType.OAK_D_PRO
 
     # === Audio Functions ===
     
@@ -1808,9 +1791,12 @@ If the object is not visible, set found to false. Only respond with valid JSON."
     # === Vision Functions ===
     
     def enhance_image(self, cv_image):
-        """Enhance dark camera images"""
+        """Enhance dark camera images (only for cameras that need it)"""
         if cv_image is None:
             return None
+        
+        if not self.camera_config.needs_enhancement:
+            return cv_image
         
         # Apply brightness enhancement
         enhanced = cv2.convertScaleAbs(cv_image, alpha=15.0, beta=30)

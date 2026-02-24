@@ -13,8 +13,8 @@ Environment="DISPLAY=:0"
 Environment="PULSE_SERVER=unix:/run/user/1000/pulse/native"
 EnvironmentFile=/home/jetson/.rosmaster_llm_env
 
-# Source ROS2 and run the script
-ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && cd /home/jetson/robot_scripts && python3 voice_mapper.py'
+# Full robot startup (hardware + voice_mapper)
+ExecStart=/bin/bash /home/jetson/robot_scripts/start_robot.sh
 
 # Restart on failure
 Restart=on-failure

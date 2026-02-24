@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
+# ⚠️ DEPRECATED: This script is hardcoded for the removed HP60C camera.
+# Use voice_mapper.py instead, which supports OAK-D Pro via CameraConfig abstraction.
+# This file is kept for reference only and is not maintained.
 """
-Yahboom-Style Voice Explorer Robot
-================================
+Yahboom-Style Voice Explorer Robot (DEPRECATED)
+================================================
 Matches Yahboom's proven depth camera usage pattern:
 - RGB stream for visual features (following, tracking, object detection)
 - Single-point depth queries on-demand (get_dist(x,y) for distance to objects)

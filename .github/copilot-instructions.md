@@ -29,7 +29,7 @@ export ROS_DOMAIN_ID=62
 # Run voice mapper (recommended)
 ./rosmaster_control.sh run
 
-# Or run alternative explorer (USB 2.0 camera)
+# Or run alternative explorer (deprecated, HP60C only)
 ./rosmaster_control.sh yahboom
 
 # Install as auto-start service
@@ -47,7 +47,7 @@ sudo ./rosmaster_control.sh service install
 │  ├─ Whisper STT (48kHz→16kHz, PulseAudio index 32)     │
 │  ├─ GPT-4o Brain + Vision                               │
 │  ├─ OpenAI TTS → ffmpeg → aplay (3x volume)            │
-│  ├─ Multi-camera: HP60C / OAK-D Pro / RealSense        │
+│  ├─ OAK-D Pro stereo camera (RGB + depth + VSLAM)      │
 │  ├─ Nav2 path planning + frontier exploration           │
 │  ├─ SLAM: LiDAR (slam_toolbox) or VSLAM (Isaac)        │
 │  └─ LiDAR: navigation & obstacle avoidance             │
@@ -57,7 +57,7 @@ sudo ./rosmaster_control.sh service install
 │  ├─ /scan (720 pts @ 10Hz, BEST_EFFORT QoS)            │
 │  ├─ /odom (wheel encoders working)                     │
 │  ├─ /imu/data (Madgwick filtered)                      │
-│  └─ /ascamera_hp60c/.../rgb0/image (RELIABLE QoS)      │
+│  └─ /oak/rgb/image_raw (OAK-D Pro, USB 3.0)            │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -67,15 +67,16 @@ sudo ./rosmaster_control.sh service install
 | Script | Purpose |
 |--------|---------|
 | `voice_mapper.py` | **Main** - Voice + Vision + Nav2 + SLAM + Isaac VSLAM |
-| `yahboom_explorer.py` | Alternative - Yahboom depth camera pattern |
+| `yahboom_explorer.py` | ⚠️ DEPRECATED - HP60C camera reference only |
 | `rosmaster_control.sh` | Master control with menu, service management |
+| `start_robot.sh` | Hardware launcher (LiDAR, camera, IMU, driver) |
 | `llm_robot_brain.py` | Core LLM provider integration |
 
 ### Setup Scripts (numbered for order)
 | Script | Purpose |
 |--------|---------|
 | `01_ssh_connect.sh` | SSH connection helper |
-| `02_setup_depth_camera.sh` | HP60C camera setup |
+| `02_setup_depth_camera.sh` | OAK-D Pro camera setup |
 | `03_setup_voice_commands.sh` | Audio/voice setup |
 | `04_setup_navigation.sh` | Nav2 + SLAM setup |
 | `05_autonomous_driving.sh` | Autonomous mode |
@@ -98,18 +99,19 @@ sudo ./rosmaster_control.sh service install
 ./rosmaster_control.sh menu         # Interactive menu
 ```
 
-## Yahboom Depth Camera Pattern
+## OAK-D Pro Camera Pattern
 
-HP60C is USB 2.0 only - cannot stream RGB+Depth simultaneously. Use Yahboom's proven pattern:
+OAK-D Pro is USB 3.0 — supports simultaneous RGB, depth, and stereo streams:
 
 ```python
-# RGB streaming (continuous) - stays within USB 2.0 bandwidth
-self.rgb_sub = create_subscription(Image, ".../rgb0/image", ...)
+# RGB streaming (continuous)
+self.rgb_sub = create_subscription(Image, "/oak/rgb/image_raw", ...)
 
-# Depth queries (on-demand) - NOT continuous streaming
-def get_dist(self, x: int, y: int) -> float:
-    """Query depth at specific pixel - Yahboom pattern"""
-    return self.latest_depth[y, x] / 1000.0  # mm to meters
+# Depth streaming (continuous) — available via USB 3.0 bandwidth
+self.depth_sub = create_subscription(Image, "/oak/stereo/image_raw", ...)
+
+# Stereo pair for VSLAM (Isaac cuVSLAM)
+# /oak/left/image_rect and /oak/right/image_rect
 
 # LiDAR for navigation (continuous) - primary nav sensor
 self.scan_sub = create_subscription(LaserScan, "/scan", ...)
@@ -130,15 +132,15 @@ self.scan_sub = create_subscription(LaserScan, "/scan", ...)
 | `/scan` | LaserScan | BEST_EFFORT | LiDAR (720 points, ~10Hz) |
 | `/odom` | Odometry | BEST_EFFORT | Wheel odometry |
 | `/imu/data` | Imu | - | Filtered IMU (Madgwick) |
-| `/ascamera_hp60c/camera_publisher/rgb0/image` | Image | RELIABLE | RGB camera (640x480@20fps) |
+| `/oak/rgb/image_raw` | Image | RELIABLE | OAK-D Pro RGB camera (640x480@30fps) |
+| `/oak/stereo/image_raw` | Image | RELIABLE | OAK-D Pro depth stream |
 
 ## Hardware Configuration
 
 | Component | Model | Notes |
 |-----------|-------|-------|
 | **LiDAR** | SLLidar C1 | NOT YDLidar - use `sllidar_ros2` package |
-| **Camera (current)** | Angstrong HP60C | USB 2.0 only - use on-demand depth queries |
-| **Camera (upgrade)** | OAK-D Pro | USB 3.0, VSLAM-capable, IR illumination |
+| **Camera** | OAK-D Pro (Luxonis) | USB 3.0, stereo depth, IR illumination, VSLAM-capable. Uses `depthai-ros` driver. |
 | **Audio** | C-Media USB | Use PulseAudio (index 32), 48kHz only |
 | **IMU** | Built-in MPU | `/imu/data`, `/imu/data_raw`, `/imu/mag` |
 | **Motors** | Built-in | `/driver_node` subscribes to `/cmd_vel` |
@@ -150,8 +152,7 @@ The `voice_mapper.py` supports Isaac ROS Visual SLAM with stereo cameras:
 ### Camera Types (CameraType enum)
 ```python
 class CameraType(Enum):
-    HP60C = "hp60c"      # Current - LiDAR SLAM only
-    OAK_D_PRO = "oakd"   # VSLAM-capable, recommended upgrade
+    OAK_D_PRO = "oakd"     # Primary camera - stereo depth + VSLAM
     REALSENSE = "realsense"  # Alternative VSLAM camera
 ```
 
@@ -177,10 +178,8 @@ sudo apt install ros-humble-depthai-ros  # For OAK-D Pro
 
 ## Known Issues
 
-1. **Camera darkness**: HP60C produces very dark images (mean brightness ~4/255). Apply 10-20x brightness enhancement in software.
-2. **Depth streaming**: HP60C is USB 2.0 only - use `get_dist(x,y)` on-demand queries instead of continuous streaming.
-3. **Audio channels**: Direct USB mic access fails with "Invalid number of channels". Use PulseAudio device (index 32) instead.
-4. **Threading**: Don't call `rclpy.spin_once()` from multiple threads - causes "generator already executing" error.
+1. **Audio channels**: Direct USB mic access fails with "Invalid number of channels". Use PulseAudio device (index 32) instead.
+2. **Threading**: Don't call `rclpy.spin_once()` from multiple threads - causes "generator already executing" error.
 
 ## LLM Provider Integration
 
@@ -239,7 +238,7 @@ elif action == "my_action":
 
 ## Hardware Dependencies
 
-- **Depth Camera**: Angstrong HP60C → `/ascamera_hp60c/camera_publisher/rgb0/image` (RELIABLE QoS)
+- **Camera**: OAK-D Pro (Luxonis) → `/oak/rgb/image_raw`, `/oak/stereo/image_raw` (RELIABLE QoS, USB 3.0)
 - **LiDAR**: SLLidar C1 → `/scan` (720 points, BEST_EFFORT QoS)
 - **IMU**: Built-in MPU → `/imu/data` (Madgwick filtered)
 - **USB Audio**: C-Media → PulseAudio index 32 (48kHz, mono)

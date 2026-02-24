@@ -192,7 +192,7 @@ local_costmap:
           inf_is_valid: true  # Important: treat inf as clear space, not unknown
         # Depth camera source - additional obstacle detection
         depth_camera:
-          topic: /ascamera_hp60c/camera_publisher/depth0/points
+          topic: /oak/points
           max_obstacle_height: 1.5
           min_obstacle_height: 0.05
           obstacle_max_range: 4.0
@@ -235,7 +235,7 @@ global_costmap:
           inf_is_valid: true  # Treat inf as clear space
         # Depth camera source
         depth_camera:
-          topic: /ascamera_hp60c/camera_publisher/depth0/points
+          topic: /oak/points
           max_obstacle_height: 1.5
           min_obstacle_height: 0.05
           obstacle_max_range: 4.0
@@ -372,7 +372,7 @@ collision_monitor:
       enabled: True
     pointcloud:
       type: "pointcloud"
-      topic: "/ascamera_hp60c/camera_publisher/depth0/points"
+      topic: "/oak/points"
       min_height: 0.05
       max_height: 1.0
       enabled: True

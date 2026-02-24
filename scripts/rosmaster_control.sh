@@ -66,8 +66,13 @@ source_ros2() {
         source /opt/ros/humble/setup.bash
     fi
     
-    if [ -f ~/rosmaster_a1_ws/install/setup.bash ]; then
-        source ~/rosmaster_a1_ws/install/setup.bash
+    # Source Yahboom workspaces (library_ws must come before yahboomcar_ws)
+    if [ -f ~/yahboomcar_ros2_ws/software/library_ws/install/setup.bash ]; then
+        source ~/yahboomcar_ros2_ws/software/library_ws/install/setup.bash
+    fi
+    
+    if [ -f ~/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash ]; then
+        source ~/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash
     elif [ -f ~/yahboomcar_ws/install/setup.bash ]; then
         source ~/yahboomcar_ws/install/setup.bash
     fi
@@ -156,26 +161,26 @@ full_startup() {
     
     source_ros2
     
-    # Start robot base
+    # Start robot base (A1 bringup with odometry/EKF)
     print_info "Starting robot base..."
     if ros2 pkg list | grep -q "yahboomcar_bringup"; then
-        ros2 launch yahboomcar_bringup bringup_launch.py \
+        ros2 launch yahboomcar_bringup yahboomcar_bringup_A1_launch.py \
             > ${LOG_DIR}/bringup.log 2>&1 &
         save_pid "bringup" $!
         sleep 5
     fi
     
-    # Start depth camera
-    print_info "Starting depth camera..."
-    bash ${SCRIPT_DIR}/02_setup_depth_camera.sh launch \
+    # Start depth camera (OAK-D Pro via depthai-ros)
+    print_info "Starting depth camera (OAK-D Pro)..."
+    ros2 launch depthai_ros_driver camera.launch.py camera_model:=OAK-D-PRO \
         > ${LOG_DIR}/camera.log 2>&1 &
     save_pid "camera" $!
     sleep 3
     
-    # Start LiDAR
+    # Start LiDAR (SLLidar C1)
     print_info "Starting LiDAR..."
-    if ros2 pkg list | grep -q "ldlidar\|yahboomcar"; then
-        ros2 launch yahboomcar_bringup lidar_launch.py \
+    if ros2 pkg list | grep -q "sllidar_ros2"; then
+        ros2 launch sllidar_ros2 sllidar_c1_launch.py \
             > ${LOG_DIR}/lidar.log 2>&1 &
         save_pid "lidar" $!
         sleep 3
@@ -277,6 +282,12 @@ run_voice_mapper() {
 
 # Run yahboom_explorer.py (alternative for USB 2.0 cameras)
 run_yahboom_explorer() {
+    print_warning "=== DEPRECATION WARNING ==="
+    print_warning "yahboom_explorer.py is deprecated. Use voice_mapper.py instead."
+    print_warning "Run: ./rosmaster_control.sh run"
+    print_warning "==========================="
+    echo ""
+    
     print_info "Starting Yahboom Explorer (alternative script)..."
     
     source_ros2
@@ -337,7 +348,7 @@ Environment="ROS_DOMAIN_ID=62"
 Environment="DISPLAY=:0"
 Environment="PULSE_SERVER=unix:/run/user/1000/pulse/native"
 EnvironmentFile=/home/jetson/.rosmaster_llm_env
-ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && cd /home/jetson/robot_scripts && python3 voice_mapper.py'
+ExecStart=/bin/bash /home/jetson/robot_scripts/start_robot.sh
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=10
