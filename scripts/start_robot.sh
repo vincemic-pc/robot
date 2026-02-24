@@ -61,16 +61,17 @@ sleep 2
 
 # 4c. Depth camera (OAK-D Pro via depthai-ros)
 echo "[start_robot.sh] Starting OAK-D Pro camera..."
-ros2 launch depthai_ros_driver camera.launch.py camera_model:=OAK-D-PRO &
+ros2 launch depthai_ros_driver camera.launch.py camera_model:=OAK-D-PRO \
+    left.i_publish_topic:=true right.i_publish_topic:=true &
 CAMERA_PID=$!
 sleep 3
 
 # 4d. Static TF: camera_link → oak-d-base-frame
-#     The OAK-D is mounted upside-down, so we apply a π (180°) roll rotation.
+#     Camera is mounted right-side-up (confirmed via Phase 3 discovery).
 #     Positional args: x y z yaw pitch roll frame_id child_frame_id
-echo "[start_robot.sh] Publishing static TF (camera_link -> oak-d-base-frame, roll=pi)..."
+echo "[start_robot.sh] Publishing static TF (camera_link -> oak-d-base-frame)..."
 ros2 run tf2_ros static_transform_publisher \
-    0 0 0 0 0 3.14159265 camera_link oak-d-base-frame &
+    0 0 0 0 0 0 camera_link oak-d-base-frame &
 TF_PID=$!
 
 # ==============================================================================

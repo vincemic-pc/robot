@@ -1432,10 +1432,12 @@ If the object is not visible, set found to false. Only respond with valid JSON."
                 "enable_slam_visualization:=true",
             ]
             
-            # Add remappings
-            for remap in remappings:
-                cmd.append(f"--remap")
-                cmd.append(remap)
+            # Add remappings (--ros-args -r syntax for ros2 launch)
+            if remappings:
+                cmd.append("--ros-args")
+                for remap in remappings:
+                    cmd.append("-r")
+                    cmd.append(remap)
             
             self.get_logger().info(f"Launch command: {' '.join(cmd[:5])}...")
             
