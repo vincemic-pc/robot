@@ -1,0 +1,33 @@
+[Unit]
+Description=Voice-Controlled Mapping Explorer Robot
+After=network.target sound.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=jetson
+Group=jetson
+Environment="HOME=/home/jetson"
+Environment="ROS_DOMAIN_ID=62"
+Environment="DISPLAY=:0"
+Environment="PULSE_SERVER=unix:/run/user/1000/pulse/native"
+EnvironmentFile=/home/jetson/.rosmaster_llm_env
+
+# Source ROS2 and run the script
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && cd /home/jetson/robot_scripts && python3 voice_mapper.py'
+
+# Restart on failure
+Restart=on-failure
+RestartSec=10
+
+# Stop gracefully
+TimeoutStopSec=10
+KillMode=mixed
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voice_mapper
+
+[Install]
+WantedBy=multi-user.target
