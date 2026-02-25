@@ -389,8 +389,12 @@ class VoiceMapper(Node):
         self.get_logger().info("Voice Mapper initialized!")
 
     def _find_microphone(self):
-        """Find microphone - prefer PulseAudio"""
+        """Find microphone - prefer direct USB Audio hardware device over PulseAudio.
+        PulseAudio (index 32) can return silent buffers when the system audio
+        routing is misconfigured. Direct ALSA access to the USB Audio Device
+        (typically index 0) is more reliable."""
         p = pyaudio.PyAudio()
+        usb_audio_index = None
         pulse_index = None
         
         for i in range(p.get_device_count()):
@@ -398,17 +402,24 @@ class VoiceMapper(Node):
             name = info.get('name', '').lower()
             max_input = info.get('maxInputChannels', 0)
             
-            if 'pulse' in name and max_input > 0:
-                pulse_index = i
-                break
+            if max_input > 0:
+                # Prefer direct USB Audio hardware device
+                if 'usb audio device' in name and 'hw:' in name:
+                    usb_audio_index = i
+                elif 'pulse' in name:
+                    pulse_index = i
         
         p.terminate()
+        
+        if usb_audio_index is not None:
+            self.get_logger().info(f"Using USB Audio hardware device (index {usb_audio_index})")
+            return usb_audio_index
         
         if pulse_index is not None:
             self.get_logger().info(f"Using PulseAudio device (index {pulse_index})")
             return pulse_index
         
-        self.get_logger().warning("No PulseAudio found, using device 0")
+        self.get_logger().warning("No USB Audio or PulseAudio found, using device 0")
         return 0
 
     def _init_nav2(self):
@@ -417,6 +428,7 @@ class VoiceMapper(Node):
         self.nav2_process = None
         self.navigating = False
         self.current_goal = None
+        self.nav_goal_handle = None
         self.nav_feedback = None
         
         # Nav2 action clients
@@ -536,6 +548,7 @@ class VoiceMapper(Node):
             self.navigating = False
             return
         
+        self.nav_goal_handle = goal_handle
         self.get_logger().info("Navigation goal accepted")
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(self._nav_result_callback)
@@ -577,7 +590,9 @@ class VoiceMapper(Node):
     def cancel_navigation(self):
         """Cancel current navigation"""
         if self.navigating and self.nav_to_pose_client:
-            self.nav_to_pose_client._cancel_goal_async()
+            if self.nav_goal_handle is not None:
+                self.nav_goal_handle.cancel_goal_async()
+                self.nav_goal_handle = None
             self.navigating = False
             self.get_logger().info("Navigation canceled")
 
@@ -797,7 +812,16 @@ COMMANDS (respond with JSON):
 
 1. Movement: {"action": "move", "linear": 0.15, "angular": 0.0, "duration": 2.0, "speech": "Moving forward"}
    - linear: -0.2 to 0.2 m/s (Ackerman steering limits speed)
-   - angular: -0.3 to 0.3 rad/s (turning rate)
+   - angular: -0.5 to 0.5 rad/s (turning rate)
+   - duration: up to 15 seconds
+   - For large turns (90°+), use high angular (0.4-0.5) and enough duration
+   - 90° turn ≈ angular 0.5 for 3.5s, 180° ≈ angular 0.5 for 7s
+   - Robot has Ackerman steering: it drives a small arc while turning, it cannot spin in place
+
+1b. Turn Around (U-turn): {"action": "turn_around", "speech": "Turning around!"}
+   - Executes a 3-point U-turn (forward arc, reverse arc, forward arc)
+   - USE THIS when the user says something is behind them, or asks to turn around/go back
+   - Safer and more reliable than a long move command for 180° turns
 
 2. Look/Observe: {"action": "look", "speech": "Let me see..."}
 
@@ -1397,47 +1421,20 @@ If the object is not visible, set found to false. Only respond with valid JSON."
         self.get_logger().info("🎯 Starting Isaac ROS Visual SLAM...")
         
         try:
-            # Build topic remapping for camera
-            # Isaac VSLAM expects: /visual_slam/image_0, /visual_slam/image_1, etc.
-            remappings = []
-            
-            if self.camera_type == CameraType.OAK_D_PRO:
-                # OAK-D Pro topic remapping
-                remappings = [
-                    f"/visual_slam/image_0:={self.camera_config.left_topic}",
-                    f"/visual_slam/image_1:={self.camera_config.right_topic}",
-                    f"/visual_slam/camera_info_0:={self.camera_config.camera_info_left}",
-                    f"/visual_slam/camera_info_1:={self.camera_config.camera_info_right}",
-                ]
-                if self.camera_config.imu_topic:
-                    remappings.append(f"/visual_slam/imu:={self.camera_config.imu_topic}")
-            
-            elif self.camera_type == CameraType.REALSENSE:
-                # RealSense topic remapping
-                remappings = [
-                    f"/visual_slam/image_0:={self.camera_config.left_topic}",
-                    f"/visual_slam/image_1:={self.camera_config.right_topic}",
-                    f"/visual_slam/camera_info_0:={self.camera_config.camera_info_left}",
-                    f"/visual_slam/camera_info_1:={self.camera_config.camera_info_right}",
-                ]
-                if self.camera_config.imu_topic:
-                    remappings.append(f"/visual_slam/imu:={self.camera_config.imu_topic}")
-            
-            # Launch Isaac VSLAM node
-            cmd = [
-                "ros2", "launch", "isaac_ros_visual_slam", "isaac_ros_visual_slam.launch.py",
-                "num_cameras:=2",
-                "enable_imu_fusion:=true" if self.camera_config.imu_topic else "enable_imu_fusion:=false",
-                "enable_localization_n_mapping:=true",
-                "enable_slam_visualization:=true",
-            ]
-            
-            # Add remappings (--ros-args -r syntax for ros2 launch)
-            if remappings:
-                cmd.append("--ros-args")
-                for remap in remappings:
-                    cmd.append("-r")
-                    cmd.append(remap)
+            # Launch Isaac VSLAM via custom launch file with ComposableNode
+            # params and remappings baked in (stock launcher silently ignores
+            # all launch arguments — no DeclareLaunchArgument defined).
+            # NOTE: oakd_vslam.launch.py is OAK-D Pro specific. RealSense would
+            # need a separate launch file if re-added in the future.
+            if self.camera_type != CameraType.OAK_D_PRO:
+                self.get_logger().error(
+                    f"❌ VSLAM launch only supports OAK-D Pro, got {self.camera_type.value}")
+                return False
+            launch_file = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "oakd_vslam.launch.py"
+            )
+            cmd = ["ros2", "launch", launch_file]
             
             self.get_logger().info(f"Launch command: {' '.join(cmd[:5])}...")
             
@@ -1873,6 +1870,82 @@ If the object is not visible, set found to false. Only respond with valid JSON."
             time.sleep(0.02)
         self.get_logger().warning("🚨 EMERGENCY STOP!")
 
+    def _execute_uturn(self):
+        """Execute a 3-point U-turn for Ackerman steering robot.
+        The robot can't spin in place, so we do:
+        1. Turn wheels + drive forward in an arc
+        2. Turn wheels opposite + reverse in an arc
+        3. Turn wheels + drive forward to complete
+        """
+        self.get_logger().info("🔄 Executing 3-point U-turn...")
+        twist = Twist()
+        
+        # Phase 1: Forward arc turn (steer left, drive forward)
+        self.get_logger().info("U-turn phase 1: Forward left arc")
+        for _ in range(60):  # 3 seconds at 20Hz
+            if hasattr(self, 'emergency_stop_triggered') and self.emergency_stop_triggered:
+                self.emergency_stop()
+                self.emergency_stop_triggered = False
+                self.get_logger().warning("U-turn aborted: emergency stop")
+                return
+            front_dist = self.obstacle_distances.get("front", 10)
+            if front_dist < self.min_obstacle_dist:
+                break
+            twist.linear.x = 0.12
+            twist.angular.z = 0.5
+            self.cmd_vel_pub.publish(twist)
+            time.sleep(0.05)
+        
+        # Brief stop
+        twist.linear.x = 0.0
+        twist.angular.z = 0.0
+        self.cmd_vel_pub.publish(twist)
+        time.sleep(0.3)
+        
+        # Phase 2: Reverse arc turn (steer right, drive backward)
+        self.get_logger().info("U-turn phase 2: Reverse right arc")
+        for _ in range(60):  # 3 seconds
+            if hasattr(self, 'emergency_stop_triggered') and self.emergency_stop_triggered:
+                self.emergency_stop()
+                self.emergency_stop_triggered = False
+                self.get_logger().warning("U-turn aborted: emergency stop")
+                return
+            back_blocked = self.obstacles.get("back", False)
+            if back_blocked:
+                break
+            twist.linear.x = -0.10
+            twist.angular.z = -0.5
+            self.cmd_vel_pub.publish(twist)
+            time.sleep(0.05)
+        
+        # Brief stop
+        twist.linear.x = 0.0
+        twist.angular.z = 0.0
+        self.cmd_vel_pub.publish(twist)
+        time.sleep(0.3)
+        
+        # Phase 3: Forward arc to complete the turn
+        self.get_logger().info("U-turn phase 3: Forward left arc to complete")
+        for _ in range(60):  # 3 seconds
+            if hasattr(self, 'emergency_stop_triggered') and self.emergency_stop_triggered:
+                self.emergency_stop()
+                self.emergency_stop_triggered = False
+                self.get_logger().warning("U-turn aborted: emergency stop")
+                return
+            front_dist = self.obstacle_distances.get("front", 10)
+            if front_dist < self.min_obstacle_dist:
+                break
+            twist.linear.x = 0.12
+            twist.angular.z = 0.5
+            self.cmd_vel_pub.publish(twist)
+            time.sleep(0.05)
+        
+        # Final stop
+        twist.linear.x = 0.0
+        twist.angular.z = 0.0
+        self.cmd_vel_pub.publish(twist)
+        self.get_logger().info("🔄 U-turn complete!")
+
     def move(self, linear, angular, duration):
         """Move with robust obstacle avoidance"""
         twist = Twist()
@@ -2048,10 +2121,15 @@ Status:
         action = data.get("action", "speak")
         speech = data.get("speech", "")
         
-        if action == "move":
+        if action == "turn_around":
+            if speech:
+                self.speak(speech)
+            self._execute_uturn()
+        
+        elif action == "move":
             linear = max(-0.2, min(0.2, float(data.get("linear", 0))))
-            angular = max(-0.3, min(0.3, float(data.get("angular", 0))))
-            duration = min(5.0, float(data.get("duration", 2)))
+            angular = max(-0.5, min(0.5, float(data.get("angular", 0))))
+            duration = min(15.0, float(data.get("duration", 2)))
             
             if speech:
                 self.speak(speech)

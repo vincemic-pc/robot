@@ -60,9 +60,14 @@ LIDAR_PID=$!
 sleep 2
 
 # 4c. Depth camera (OAK-D Pro via depthai-ros)
+#     Parameters delivered via YAML params_file (CLI key:=value overrides are
+#     silently ignored by camera.launch.py — it has no DeclareLaunchArgument).
+#     oakd_params.yaml sets: USB 2.0 speed, RGBD pipeline, synced stereo rect
+#     pair publishing, 400P@30fps stereo (raw), 480P@15fps RGB (MJPEG), IR off.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 echo "[start_robot.sh] Starting OAK-D Pro camera..."
 ros2 launch depthai_ros_driver camera.launch.py camera_model:=OAK-D-PRO \
-    left.i_publish_topic:=true right.i_publish_topic:=true &
+    params_file:=${SCRIPT_DIR}/oakd_params.yaml &
 CAMERA_PID=$!
 sleep 3
 
