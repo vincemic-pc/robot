@@ -62,8 +62,9 @@ sleep 2
 # 4c. Depth camera (OAK-D Pro via depthai-ros)
 #     Parameters delivered via YAML params_file (CLI key:=value overrides are
 #     silently ignored by camera.launch.py — it has no DeclareLaunchArgument).
-#     oakd_params.yaml sets: USB 2.0 speed, RGBD pipeline, synced stereo rect
-#     pair publishing, 400P@30fps stereo (raw), 480P@15fps RGB (MJPEG), IR off.
+#     oakd_params.yaml sets: depth pipeline, USB 2.0 HIGH speed, stereo
+#     720P@10fps (raw), synced rect pair, IR off, no NN.
+#     RGB disabled to conserve USB 2.0 bandwidth (~17.6 MB/s stereo pair).
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 echo "[start_robot.sh] Starting OAK-D Pro camera..."
 ros2 launch depthai_ros_driver camera.launch.py camera_model:=OAK-D-PRO \
@@ -71,9 +72,18 @@ ros2 launch depthai_ros_driver camera.launch.py camera_model:=OAK-D-PRO \
 CAMERA_PID=$!
 sleep 3
 
-# 4d. Static TF: camera_link → oak-d-base-frame
-#     Camera is mounted right-side-up (confirmed via Phase 3 discovery).
+# 4d. Static TF: base_link → camera_link
+#     Bridges robot TF tree to camera TF tree.
+#     Camera driver publishes camera_link → oak-d-base-frame → oak → camera frames.
+#     Without this, VSLAM cannot find the base_link → camera_optical_frame chain.
 #     Positional args: x y z yaw pitch roll frame_id child_frame_id
+echo "[start_robot.sh] Publishing static TF (base_link -> camera_link)..."
+ros2 run tf2_ros static_transform_publisher \
+    0.05 0 0.1 0 0 0 base_link camera_link &
+TF_BASE_CAMERA_PID=$!
+
+# 4e. Static TF: camera_link → oak-d-base-frame
+#     Camera is mounted right-side-up (confirmed via Phase 3 discovery).
 echo "[start_robot.sh] Publishing static TF (camera_link -> oak-d-base-frame)..."
 ros2 run tf2_ros static_transform_publisher \
     0 0 0 0 0 0 camera_link oak-d-base-frame &

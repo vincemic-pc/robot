@@ -1,11 +1,15 @@
-# oakd_params.yaml — OAK-D Pro config for RGBD + VSLAM on USB 2.0
-# Bandwidth budget: ~31.5 MB/s (USB 2.0 with double hub, ~30 MB/s capacity)
+# oakd_params.yaml — OAK-D Pro config for stereo VSLAM + RGB on USB 2.0
+# Bandwidth budget: ~29 MB/s target (USB 2.0 single-hub, ~40 MB/s practical max)
 #
-# Streams:
-#   RGB  480P@15fps MJPEG q50  (~0.7 MB/s)
-#   Depth 400P@30fps raw       (~15.4 MB/s)
-#   Stereo L/R rect 400P@30fps (~15.4 MB/s)
-#   IMU                        (~0.01 MB/s)
+# Strategy: RGBD pipeline with MJPEG-compressed RGB to save bandwidth.
+#   Stereo L/R rect 720P@15fps raw  (~27.6 MB/s pair)  — for VSLAM
+#   RGB 1080P@5fps MJPEG             (~1-2 MB/s)        — for LLM vision
+#   IMU                              (~0.01 MB/s)
+#   Total estimate: ~29 MB/s         — within single-hub USB 2.0 budget
+#
+# Sensor limits discovered during live testing:
+#   IMX378 (RGB):  supports 1080 only (720, 480P rejected)
+#   OV9282 (mono): supports 720 only (400, 480, 800 rejected by this unit)
 #
 # WARNING: Do NOT use CLI parameter overrides (key:=value) with camera.launch.py.
 # They are silently ignored. All parameters must be in this YAML file.
@@ -13,24 +17,25 @@
 /oak:
   ros__parameters:
     camera:
-      i_pipeline_type: RGBD
-      i_usb_speed: "HIGH"          # USB 2.0 (480 Mbps) — matches physical bus
-      i_enable_imu: true            # BMI270 IMU for VSLAM fusion
-      i_enable_ir: false            # IR OFF — dots create false VSLAM features
-      i_nn_type: none               # Disable NN to save MyriadX resources
+      i_pipeline_type: RGBD          # RGB + Depth — both needed for LLM vision + VSLAM
+      i_usb_speed: "HIGH"            # USB 2.0 (480 Mbps) — matches physical bus
+      i_enable_imu: true             # BMI270 IMU for VSLAM fusion
+      i_enable_ir: false             # IR OFF — dots create false VSLAM features
+      i_nn_type: none                # Disable NN to save MyriadX resources
     rgb:
-      i_resolution: "480P"          # 640x480 — smallest useful for LLM vision
-      i_fps: 15.0                   # Reduced fps to save bandwidth for stereo
-      i_low_bandwidth: true         # MJPEG compression on-chip
-      i_low_bandwidth_quality: 50   # MJPEG quality (10:1 compression)
+      i_resolution: "1080"           # 1920x1080 — IMX378 minimum supported on this unit
+      i_fps: 5.0                     # 5fps — low to save USB bandwidth for stereo
+      i_low_bandwidth: true          # MJPEG encoding — saves ~95% bandwidth
+      i_low_bandwidth_quality: 50    # MJPEG quality 50 — sufficient for LLM vision
     left:
-      i_resolution: "400"           # 640x400 — matches isaac_vslam.yaml
-      i_fps: 30.0                   # 30fps = VSLAM minimum requirement
+      i_resolution: "720"            # 1280x720 — OV9282 only supported resolution
+      i_fps: 15.0                    # 15fps — actual ~10Hz on single-hub USB 2.0
+      i_low_bandwidth: false         # RAW required — MJPEG corrupts VSLAM features
     right:
-      i_resolution: "400"           # Must match left
-      i_fps: 30.0                   # Must match left
+      i_resolution: "720"            # Must match left
+      i_fps: 15.0                    # Must match left
+      i_low_bandwidth: false         # RAW required — MJPEG corrupts VSLAM features
     stereo:
       i_publish_synced_rect_pair: true    # HW-synced rectified L/R for VSLAM
       i_reverse_stereo_socket_order: true # OAK-D Pro socket order
-      i_output_disparity: true            # Keep depth output for Nav2
-      i_low_bandwidth: false              # RAW required — MJPEG corrupts VSLAM
+      i_low_bandwidth: false              # RAW stereo depth required
