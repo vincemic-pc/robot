@@ -1,8 +1,8 @@
 [Unit]
 Description=Voice-Controlled Mapping Explorer
-After=robot-base.service robot-lidar.service robot-camera.service robot-tf.service robot-vslam.service
+After=robot-base.service robot-lidar.service robot-camera.service robot-tf.service robot-vslam.service robot-arbiter.service
 Requires=robot-base.service robot-lidar.service robot-tf.service
-Wants=robot-camera.service robot-vslam.service
+Wants=robot-camera.service robot-vslam.service robot-arbiter.service
 
 [Service]
 Type=simple

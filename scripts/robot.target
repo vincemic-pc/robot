@@ -1,6 +1,6 @@
 [Unit]
 Description=Robot Complete System
-Wants=robot-base.service robot-lidar.service robot-camera.service robot-tf.service robot-vslam.service robot-voice-mapper.service
+Wants=robot-base.service robot-lidar.service robot-camera.service robot-tf.service robot-vslam.service robot-arbiter.service robot-voice-mapper.service
 After=network.target sound.target
 
 [Install]

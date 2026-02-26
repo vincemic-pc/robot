@@ -1,0 +1,23 @@
+[Unit]
+Description=Velocity Arbiter (sole /cmd_vel publisher, safety filter, PID)
+After=robot-base.service robot-lidar.service robot-tf.service
+Requires=robot-base.service robot-lidar.service
+StartLimitBurst=10
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+User=jetson
+Group=jetson
+Environment="HOME=/home/jetson"
+ExecStart=/bin/bash /home/jetson/robot_scripts/run_arbiter.sh
+Restart=always
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=robot-arbiter
+
+[Install]
+WantedBy=robot.target

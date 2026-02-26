@@ -12,4 +12,8 @@ if [ -f ~/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash ]; then
     source ~/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash
 fi
 
+if [ -f ~/robot_ws/install/setup.bash ]; then
+    source ~/robot_ws/install/setup.bash
+fi
+
 export ROS_DOMAIN_ID=62

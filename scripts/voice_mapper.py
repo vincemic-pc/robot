@@ -48,6 +48,7 @@ from std_srvs.srv import Empty
 from nav2_msgs.action import NavigateToPose, ComputePathToPose
 from nav2_msgs.srv import ClearEntireCostmap
 from action_msgs.msg import GoalStatus
+from robot_interfaces.msg import VelocityRequest
 
 # Try CV imports
 try:
@@ -251,8 +252,8 @@ class VoiceMapper(Node):
         self.discovery_log = DiscoveryLog()
         
         # Robot control
-        self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
-        
+        self.vel_request_pub = self.create_publisher(VelocityRequest, "/cmd_vel_request", 10)
+
         # VSLAM state
         self.vslam_process = None
         self.vslam_available = False
@@ -532,11 +533,15 @@ class VoiceMapper(Node):
             time.sleep(3)
         
         try:
-            # Launch Nav2 with our parameters
+            # Launch Nav2 with our parameters.
+            # Remap /cmd_vel -> /cmd_vel_nav2 so velocity_smoother output
+            # goes through the velocity arbiter instead of directly to the
+            # motor driver (Review R5 in plan 007).
             nav2_cmd = [
                 "ros2", "launch", "nav2_bringup", "navigation_launch.py",
                 "use_sim_time:=false",
-                f"params_file:=/home/jetson/robot_scripts/nav2_params.yaml"
+                f"params_file:=/home/jetson/robot_scripts/nav2_params.yaml",
+                "--ros-args", "-r", "/cmd_vel:=/cmd_vel_nav2",
             ]
             
             self.nav2_process = subprocess.Popen(
@@ -1974,167 +1979,124 @@ If the object is not visible, set found to false. Only respond with valid JSON."
             return "Vision processing failed.", None
 
     # === Movement Functions ===
-    
+
+    def _publish_velocity_request(self, linear, angular, priority, source,
+                                  duration_s=0.0, target_heading=float('nan'),
+                                  use_velocity_pid=True):
+        """Build and publish a VelocityRequest to the arbiter.
+
+        All cmd_vel paths go through this helper so the arbiter is the sole
+        /cmd_vel publisher.  ROS2 publish() is thread-safe.
+        """
+        msg = VelocityRequest()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.twist.linear.x = float(linear)
+        msg.twist.angular.z = float(angular)
+        msg.priority = int(priority)
+        msg.source = str(source)
+        msg.duration_s = float(duration_s)
+        msg.target_heading = float(target_heading)
+        msg.use_velocity_pid = bool(use_velocity_pid)
+        self.vel_request_pub.publish(msg)
+
     def emergency_stop(self):
-        """Immediate stop - publish multiple times to ensure delivery"""
-        twist = Twist()
-        for _ in range(5):
-            self.cmd_vel_pub.publish(twist)
-            time.sleep(0.02)
-        self.get_logger().warning("🚨 EMERGENCY STOP!")
+        """Immediate stop — arbiter handles it at EMERGENCY priority."""
+        self._publish_velocity_request(
+            0, 0, VelocityRequest.PRIORITY_EMERGENCY, "emergency_stop",
+            duration_s=1.0)
+        self.get_logger().warning("EMERGENCY STOP!")
+
+    @staticmethod
+    def _normalize_angle(angle):
+        """Normalize angle to [-pi, pi]."""
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+    def _uturn_phase(self, linear, target_heading, source, timeout_s=4.0):
+        """Execute one phase of a U-turn using heading PID via the arbiter.
+
+        Publishes a VelocityRequest with target_heading so the arbiter's
+        heading PID controller closes the loop. Polls until the heading is
+        within tolerance or the timeout expires. The arbiter handles all
+        obstacle safety.
+
+        Returns True if the phase converged, False if aborted/timed out.
+        """
+        tolerance = math.radians(10)  # +/- 10 degrees
+        self._publish_velocity_request(
+            linear, 0, VelocityRequest.PRIORITY_MANUAL, source,
+            duration_s=timeout_s, target_heading=target_heading)
+        start = time.time()
+        while time.time() - start < timeout_s and self.running:
+            if hasattr(self, 'emergency_stop_triggered') and self.emergency_stop_triggered:
+                self.emergency_stop()
+                self.emergency_stop_triggered = False
+                self.get_logger().warning("U-turn aborted: emergency stop")
+                return False
+            current = self.current_position['theta']
+            error = abs(self._normalize_angle(target_heading - current))
+            if error < tolerance:
+                return True
+            # Re-publish to keep the request alive and fresh
+            self._publish_velocity_request(
+                linear, 0, VelocityRequest.PRIORITY_MANUAL, source,
+                duration_s=timeout_s, target_heading=target_heading)
+            time.sleep(0.1)
+        return False
 
     def _execute_uturn(self):
-        """Execute a 3-point U-turn for Ackerman steering robot.
-        The robot can't spin in place, so we do:
-        1. Turn wheels + drive forward in an arc
-        2. Turn wheels opposite + reverse in an arc
-        3. Turn wheels + drive forward to complete
+        """Execute a 3-point U-turn using heading PID via the arbiter.
+
+        Retains the 3-phase structure for Ackerman geometry but replaces
+        timed open-loop arcs with heading PID sub-goals (Review R2).
+        The arbiter handles all obstacle safety filtering.
         """
-        self.get_logger().info("🔄 Executing 3-point U-turn...")
-        twist = Twist()
-        
-        # Phase 1: Forward arc turn (steer left, drive forward)
-        self.get_logger().info("U-turn phase 1: Forward left arc")
-        for _ in range(60):  # 3 seconds at 20Hz
-            if hasattr(self, 'emergency_stop_triggered') and self.emergency_stop_triggered:
-                self.emergency_stop()
-                self.emergency_stop_triggered = False
-                self.get_logger().warning("U-turn aborted: emergency stop")
-                return
-            front_dist = self.obstacle_distances.get("front", 10)
-            if front_dist < self.min_obstacle_dist:
-                break
-            twist.linear.x = 0.12
-            twist.angular.z = 0.5
-            self.cmd_vel_pub.publish(twist)
-            time.sleep(0.05)
-        
-        # Brief stop
-        twist.linear.x = 0.0
-        twist.angular.z = 0.0
-        self.cmd_vel_pub.publish(twist)
+        self.get_logger().info("Executing 3-point U-turn (heading PID)...")
+        original_heading = self.current_position['theta']
+
+        # Phase 1: forward arc, target +60 degrees
+        target_1 = self._normalize_angle(original_heading + math.pi / 3)
+        self.get_logger().info("U-turn phase 1: target heading +60 deg")
+        if not self._uturn_phase(0.12, target_1, "uturn_p1"):
+            self.get_logger().warning("U-turn phase 1 did not converge")
+
+        # Brief stop between phases
+        self._publish_velocity_request(
+            0, 0, VelocityRequest.PRIORITY_MANUAL, "uturn_stop", duration_s=0.3)
         time.sleep(0.3)
-        
-        # Phase 2: Reverse arc turn (steer right, drive backward)
-        self.get_logger().info("U-turn phase 2: Reverse right arc")
-        for _ in range(60):  # 3 seconds
-            if hasattr(self, 'emergency_stop_triggered') and self.emergency_stop_triggered:
-                self.emergency_stop()
-                self.emergency_stop_triggered = False
-                self.get_logger().warning("U-turn aborted: emergency stop")
-                return
-            back_blocked = self.obstacles.get("back", False)
-            if back_blocked:
-                break
-            twist.linear.x = -0.10
-            twist.angular.z = -0.5
-            self.cmd_vel_pub.publish(twist)
-            time.sleep(0.05)
-        
+
+        # Phase 2: reverse arc, target +120 degrees
+        target_2 = self._normalize_angle(original_heading + 2 * math.pi / 3)
+        self.get_logger().info("U-turn phase 2: reverse arc, target +120 deg")
+        if not self._uturn_phase(-0.10, target_2, "uturn_p2"):
+            self.get_logger().warning("U-turn phase 2 did not converge")
+
         # Brief stop
-        twist.linear.x = 0.0
-        twist.angular.z = 0.0
-        self.cmd_vel_pub.publish(twist)
+        self._publish_velocity_request(
+            0, 0, VelocityRequest.PRIORITY_MANUAL, "uturn_stop", duration_s=0.3)
         time.sleep(0.3)
-        
-        # Phase 3: Forward arc to complete the turn
-        self.get_logger().info("U-turn phase 3: Forward left arc to complete")
-        for _ in range(60):  # 3 seconds
-            if hasattr(self, 'emergency_stop_triggered') and self.emergency_stop_triggered:
-                self.emergency_stop()
-                self.emergency_stop_triggered = False
-                self.get_logger().warning("U-turn aborted: emergency stop")
-                return
-            front_dist = self.obstacle_distances.get("front", 10)
-            if front_dist < self.min_obstacle_dist:
-                break
-            twist.linear.x = 0.12
-            twist.angular.z = 0.5
-            self.cmd_vel_pub.publish(twist)
-            time.sleep(0.05)
-        
+
+        # Phase 3: forward arc, target +180 degrees
+        target_3 = self._normalize_angle(original_heading + math.pi)
+        self.get_logger().info("U-turn phase 3: forward arc, target +180 deg")
+        if not self._uturn_phase(0.12, target_3, "uturn_p3"):
+            self.get_logger().warning("U-turn phase 3 did not converge")
+
         # Final stop
-        twist.linear.x = 0.0
-        twist.angular.z = 0.0
-        self.cmd_vel_pub.publish(twist)
-        self.get_logger().info("🔄 U-turn complete!")
-
-    def _compute_safe_velocity(self, linear, angular):
-        """Apply obstacle-based safety scaling to a velocity command.
-
-        Encapsulates: emergency stop check, multi-sector front obstacle check,
-        backward obstacle check, proportional slowdown, and Ackerman minimum
-        forward speed constraint.
-
-        Returns (actual_linear, actual_angular, should_stop, stop_reason).
-        """
-        # Emergency stop check
-        if hasattr(self, 'emergency_stop_triggered') and self.emergency_stop_triggered:
-            return 0.0, 0.0, True, "emergency_stop"
-
-        front_dist = self.obstacle_distances.get("front", 10)
-        front_wide = self.obstacle_distances.get("front_wide", 10)
-        fl = self.obstacle_distances.get("front_left", 10)
-        fr = self.obstacle_distances.get("front_right", 10)
-        min_front = min(front_dist, front_wide, fl, fr)
-
-        # Forward obstacle check
-        if linear > 0 and min_front < self.min_obstacle_dist:
-            return 0.0, 0.0, True, f"obstacle_front_{min_front:.2f}m"
-
-        # Backward obstacle check
-        if linear < 0 and self.obstacles.get("back", False):
-            return 0.0, 0.0, True, "obstacle_back"
-
-        # Proportional slowdown
-        actual_linear = linear
-        if linear > 0 and min_front < self.slow_dist:
-            speed_factor = max(0.3, (min_front - self.min_obstacle_dist) / (self.slow_dist - self.min_obstacle_dist))
-            actual_linear = self.slow_speed * speed_factor
-
-        # Ackerman constraint: can't turn in place
-        if abs(angular) > 0.1 and abs(actual_linear) < 0.05:
-            actual_linear = 0.05 * (1 if linear >= 0 else -1)
-
-        return float(actual_linear), float(angular), False, ""
+        self._publish_velocity_request(
+            0, 0, VelocityRequest.PRIORITY_MANUAL, "uturn_done", duration_s=0.5)
+        self.get_logger().info("U-turn complete!")
 
     def move(self, linear, angular, duration):
-        """Move with robust obstacle avoidance"""
-        twist = Twist()
-        start_time = time.time()
-        rate_hz = 20
-
-        while (time.time() - start_time) < duration and self.running:
-            actual_linear, actual_angular, should_stop, stop_reason = \
-                self._compute_safe_velocity(linear, angular)
-
-            if should_stop:
-                if stop_reason == "emergency_stop":
-                    self.get_logger().error("EMERGENCY: Object at {:.2f}m! Stopping!".format(
-                        self.obstacle_distances.get("front", 99)))
-                    self.emergency_stop()
-                    self.emergency_stop_triggered = False
-                    self.get_logger().info("Backing up...")
-                    backup_twist = Twist()
-                    backup_twist.linear.x = -0.1
-                    for _ in range(20):
-                        self.cmd_vel_pub.publish(backup_twist)
-                        time.sleep(0.05)
-                    self.emergency_stop()
-                    return
-                else:
-                    self.get_logger().warning(f"Obstacle stop: {stop_reason}")
-                    break
-
-            twist.linear.x = actual_linear
-            twist.angular.z = actual_angular
-            self.cmd_vel_pub.publish(twist)
-
-            time.sleep(1.0 / rate_hz)
-
-        # Stop
-        twist = Twist()
-        self.cmd_vel_pub.publish(twist)
+        """Move for a duration — arbiter handles safety filtering and obstacle avoidance."""
+        self._publish_velocity_request(
+            linear, angular, VelocityRequest.PRIORITY_MANUAL, "move",
+            duration_s=duration)
+        # Sleep so synchronous callers block for the expected duration
+        time.sleep(duration)
 
     def choose_exploration_direction(self):
         """Smart direction for mapping exploration with safety margins"""
@@ -2610,10 +2572,10 @@ Status:
             self._observing = False
 
     def llm_control_loop(self):
-        """20 Hz local control loop — sole cmd_vel publisher during LLM exploration.
+        """20 Hz local control loop for LLM exploration.
 
-        Dequeues VLM decisions, passes them through SafetyExecutor, and applies
-        velocity targets with real-time obstacle safety scaling.
+        Dequeues VLM decisions, passes them through SafetyExecutor, and
+        publishes VelocityRequests to the arbiter (which handles safety).
         """
         rate_hz = 20
         interval = 1.0 / rate_hz
@@ -2624,8 +2586,9 @@ Status:
 
             # Voice override — stop robot while paused
             if self.llm_nav_paused.is_set():
-                twist = Twist()
-                self.cmd_vel_pub.publish(twist)
+                self._publish_velocity_request(
+                    0, 0, VelocityRequest.PRIORITY_SAFETY, "llm_paused",
+                    duration_s=0.2)
                 time.sleep(interval)
                 continue
 
@@ -2676,46 +2639,44 @@ Status:
 
             # Apply current target
             if self._current_target is None:
-                # No target yet — publish zero twist
-                self.cmd_vel_pub.publish(Twist())
+                # No target yet — request zero
+                self._publish_velocity_request(
+                    0, 0, VelocityRequest.PRIORITY_EXPLORATION, "llm_idle",
+                    duration_s=0.2)
 
             elif isinstance(self._current_target, VelocityTarget):
                 elapsed = time.time() - self._target_start_time
                 if elapsed < self._current_target.duration_s:
-                    # Apply velocity with safety scaling
                     raw_twist = self._current_target.twist
-                    actual_lin, actual_ang, should_stop, reason = \
-                        self._compute_safe_velocity(
-                            raw_twist.linear.x, raw_twist.angular.z)
-                    if should_stop:
-                        self.cmd_vel_pub.publish(Twist())
-                        self._current_target = StopTarget(reason=reason)
-                    else:
-                        twist = Twist()
-                        twist.linear.x = actual_lin
-                        twist.angular.z = actual_ang
-                        self.cmd_vel_pub.publish(twist)
+                    remaining = self._current_target.duration_s - elapsed
+                    self._publish_velocity_request(
+                        raw_twist.linear.x, raw_twist.angular.z,
+                        VelocityRequest.PRIORITY_EXPLORATION, "llm_velocity",
+                        duration_s=min(remaining, 0.2))
                 else:
                     # Duration expired — stop and wait for next decision
-                    self.cmd_vel_pub.publish(Twist())
+                    self._publish_velocity_request(
+                        0, 0, VelocityRequest.PRIORITY_EXPLORATION,
+                        "llm_target_expired", duration_s=0.2)
                     self._current_target = None
 
             elif isinstance(self._current_target, NavGoalTarget):
-                # Nav2 is in control — don't publish cmd_vel while navigating
+                # Nav2 is in control — don't publish while navigating
                 if not self.navigating:
-                    # Nav2 finished or failed — clear target
                     self._current_target = None
 
             elif isinstance(self._current_target, StopTarget):
-                self.cmd_vel_pub.publish(Twist())
+                self._publish_velocity_request(
+                    0, 0, VelocityRequest.PRIORITY_EXPLORATION, "llm_stop",
+                    duration_s=0.2)
 
             # Watchdog check
             tier = self.safety_executor.watchdog.evaluate()
             if tier == "STOP_WAIT":
-                # Stop robot but keep LLM exploration alive
-                self.cmd_vel_pub.publish(Twist())
+                self._publish_velocity_request(
+                    0, 0, VelocityRequest.PRIORITY_SAFETY, "watchdog_stop",
+                    duration_s=0.2)
             elif tier == "LOCAL_NAV":
-                # Fall back to frontier exploration (Task 4.8)
                 self.get_logger().warning(
                     "VLM timeout — falling back to frontier exploration")
                 self.speak("Switching to autonomous mode")
@@ -2734,15 +2695,19 @@ Status:
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-        # Stopped — publish zero twist
-        self.cmd_vel_pub.publish(Twist())
+        # Stopped
+        self._publish_velocity_request(
+            0, 0, VelocityRequest.PRIORITY_EXPLORATION, "llm_loop_end",
+            duration_s=0.5)
         self.get_logger().info("LLM control loop ended")
 
     def _fallback_to_frontier(self):
         """Switch from LLM exploration to frontier-based exploration."""
         self.llm_exploring = False
         self.explore_mode = "reactive"
-        self.cmd_vel_pub.publish(Twist())
+        self._publish_velocity_request(
+            0, 0, VelocityRequest.PRIORITY_EXPLORATION, "fallback_stop",
+            duration_s=0.5)
         # Start the existing frontier exploration loop
         self.explore_thread = threading.Thread(
             target=self.exploration_loop, daemon=True)
@@ -2809,7 +2774,9 @@ Status:
         self._current_target = None
 
         # Stop robot immediately
-        self.cmd_vel_pub.publish(Twist())
+        self._publish_velocity_request(
+            0, 0, VelocityRequest.PRIORITY_SAFETY, "stop_llm",
+            duration_s=1.0)
 
         # Wait for threads to finish (with timeout)
         if self._vlm_thread and self._vlm_thread.is_alive():
@@ -2910,65 +2877,59 @@ Status:
         
         # Stop everything
         self.cancel_navigation()
-        twist = Twist()
-        self.cmd_vel_pub.publish(twist)
+        self._publish_velocity_request(
+            0, 0, VelocityRequest.PRIORITY_EXPLORATION, "exploration_end",
+            duration_s=0.5)
         self.get_logger().info("Exploration ended")
 
     def _random_exploration_walk(self):
-        """Do a smart exploration walk - prioritize detected doorways/gaps!"""
+        """Smart exploration walk — prioritize detected doorways/gaps.
+
+        All velocity commands go through the arbiter. The arbiter handles
+        obstacle safety, so per-loop obstacle checks are removed.
+        """
         self.explore_mode = "random-walk"
-        self.get_logger().info("🎲 Smart exploration walk to find new areas...")
-        
-        # FIRST: Check for detected doorways/gaps - these are the best targets!
+        self.get_logger().info("Smart exploration walk to find new areas...")
+
+        # FIRST: Check for detected doorways/gaps — the best targets
         if self.detected_gaps:
             best_gap = max(self.detected_gaps, key=lambda g: g['width'])
-            self.get_logger().info(f"🚪 Found doorway! angle={best_gap['angle']:.0f}°, width={best_gap['width']:.1f}m, dist={best_gap['distance']:.1f}m")
-            
-            # Turn toward the gap
-            twist = Twist()
-            gap_angle = best_gap['angle']  # Already in degrees from front
-            
-            if abs(gap_angle) > 10:  # Need to turn
-                twist.linear.x = 0.08  # Ackerman needs forward motion to turn
-                twist.angular.z = 0.3 if gap_angle > 0 else -0.3
-                turn_time = abs(gap_angle) / 30  # Rough turn time estimate
-                turn_time = min(turn_time, 3.0)  # Cap at 3s
-                
-                self.get_logger().info(f"Turning {gap_angle:.0f}° toward doorway...")
-                for _ in range(int(turn_time * 20)):
-                    if not self.exploring or not self.running:
-                        break
-                    self.cmd_vel_pub.publish(twist)
-                    time.sleep(0.05)
-            
+            self.get_logger().info(
+                f"Found doorway! angle={best_gap['angle']:.0f} deg, "
+                f"width={best_gap['width']:.1f}m, dist={best_gap['distance']:.1f}m")
+
+            gap_angle = best_gap['angle']
+
+            if abs(gap_angle) > 10:
+                ang = 0.3 if gap_angle > 0 else -0.3
+                turn_time = min(abs(gap_angle) / 30, 3.0)
+                self.get_logger().info(f"Turning {gap_angle:.0f} deg toward doorway...")
+                self._publish_velocity_request(
+                    0.08, ang, VelocityRequest.PRIORITY_EXPLORATION,
+                    "walk_gap_turn", duration_s=turn_time)
+                time.sleep(turn_time)
+
             # Drive through the gap
-            twist = Twist()
-            twist.linear.x = 0.15  # Slightly faster for doorways
-            drive_time = min(best_gap['distance'] / 0.15 + 2.0, 8.0)  # Drive through + extra
-            
-            self.get_logger().info(f"🚀 Driving through doorway for {drive_time:.1f}s")
-            threading.Thread(target=self.speak, args=("I see an opening, going through!",), daemon=True).start()
-            
-            for _ in range(int(drive_time * 20)):
-                if not self.exploring or not self.running:
-                    break
-                # Check for obstacles but be more tolerant for doorways
-                front = self.obstacle_distances.get("front", 10)
-                if front < 0.35:  # Tighter tolerance for doorways
-                    self.get_logger().warning("Too close - stopping")
-                    break
-                self.cmd_vel_pub.publish(twist)
-                time.sleep(0.05)
-            
+            drive_time = min(best_gap['distance'] / 0.15 + 2.0, 8.0)
+            self.get_logger().info(f"Driving through doorway for {drive_time:.1f}s")
+            threading.Thread(
+                target=self.speak,
+                args=("I see an opening, going through!",), daemon=True).start()
+            self._publish_velocity_request(
+                0.15, 0, VelocityRequest.PRIORITY_EXPLORATION,
+                "walk_gap_drive", duration_s=drive_time)
+            time.sleep(drive_time)
+
             # Stop
-            twist = Twist()
-            self.cmd_vel_pub.publish(twist)
+            self._publish_velocity_request(
+                0, 0, VelocityRequest.PRIORITY_EXPLORATION,
+                "walk_gap_stop", duration_s=0.3)
             return
-        
+
         # FALLBACK: Look for the direction with most open space
         best_direction = None
         best_distance = 0
-        
+
         directions = [
             ("front", self.obstacle_distances.get("front", 0)),
             ("front_left", self.obstacle_distances.get("front_left", 0)),
@@ -2976,55 +2937,43 @@ Status:
             ("left", self.obstacle_distances.get("left", 0)),
             ("right", self.obstacle_distances.get("right", 0)),
         ]
-        
+
         for name, dist in directions:
             if dist > best_distance:
                 best_distance = dist
                 best_direction = name
-        
-        self.get_logger().info(f"Best direction: {best_direction} ({best_distance:.2f}m clear)")
-        
-        # Turn toward best direction (Ackerman needs forward motion to turn)
-        twist = Twist()
-        if best_direction == "left" or best_direction == "front_left":
-            twist.linear.x = 0.08  # Ackerman minimum forward speed for turning
-            twist.angular.z = 0.4
+
+        self.get_logger().info(
+            f"Best direction: {best_direction} ({best_distance:.2f}m clear)")
+
+        # Turn toward best direction (Ackerman needs forward motion)
+        turn_time = 0.0
+        turn_ang = 0.0
+        if best_direction in ("left", "front_left"):
+            turn_ang = 0.4
             turn_time = 1.5
-        elif best_direction == "right" or best_direction == "front_right":
-            twist.linear.x = 0.08  # Ackerman minimum forward speed for turning
-            twist.angular.z = -0.4
+        elif best_direction in ("right", "front_right"):
+            turn_ang = -0.4
             turn_time = 1.5
-        else:
-            turn_time = 0
-        
-        # Turn
+
         if turn_time > 0:
-            for _ in range(int(turn_time * 20)):
-                if not self.exploring or not self.running:
-                    break
-                self.cmd_vel_pub.publish(twist)
-                time.sleep(0.05)
-        
+            self._publish_velocity_request(
+                0.08, turn_ang, VelocityRequest.PRIORITY_EXPLORATION,
+                "walk_turn", duration_s=turn_time)
+            time.sleep(turn_time)
+
         # Drive forward
-        twist = Twist()
-        twist.linear.x = 0.12
-        drive_time = min(best_distance / 0.12, 5.0)  # Drive for distance or max 5s
-        
+        drive_time = min(best_distance / 0.12, 5.0)
         self.get_logger().info(f"Driving forward for {drive_time:.1f}s")
-        for _ in range(int(drive_time * 20)):
-            if not self.exploring or not self.running:
-                break
-            # Check for obstacles
-            front = self.obstacle_distances.get("front", 10)
-            if front < 0.5:
-                self.get_logger().warning("Obstacle detected during random walk")
-                break
-            self.cmd_vel_pub.publish(twist)
-            time.sleep(0.05)
-        
+        self._publish_velocity_request(
+            0.12, 0, VelocityRequest.PRIORITY_EXPLORATION,
+            "walk_drive", duration_s=drive_time)
+        time.sleep(drive_time)
+
         # Stop
-        twist = Twist()
-        self.cmd_vel_pub.publish(twist)
+        self._publish_velocity_request(
+            0, 0, VelocityRequest.PRIORITY_EXPLORATION,
+            "walk_stop", duration_s=0.3)
 
     def _try_nav2_with_reactive_fallback(self):
         """Try to use Nav2, fall back to reactive if it fails."""
@@ -3051,105 +3000,100 @@ Status:
             self._reactive_exploration_loop()
 
     def _reactive_exploration_step(self):
-        """Single step of reactive exploration."""
-        # Use narrow ±30° cone for exploration (not the full 135° combined sector)
+        """Single step of reactive exploration via arbiter."""
+        # Use narrow +/-30 deg cone for exploration
         front_wide = self.obstacle_distances.get("front_wide", 10)
-
-        twist = Twist()
 
         if front_wide < self.explore_obstacle_dist:
             # Forward arc turn — Ackerman needs forward motion to steer
             left = self.obstacle_distances.get("left", 10)
             right = self.obstacle_distances.get("right", 10)
-            twist.linear.x = 0.08
-            twist.angular.z = 0.4 if left > right else -0.4
+            lin, ang = 0.08, (0.4 if left > right else -0.4)
         else:
             # Go forward with slight random variation
-            twist.linear.x = 0.1
-            twist.angular.z = random.uniform(-0.1, 0.1)
+            lin, ang = 0.1, random.uniform(-0.1, 0.1)
 
-        self.cmd_vel_pub.publish(twist)
+        self._publish_velocity_request(
+            lin, ang, VelocityRequest.PRIORITY_EXPLORATION,
+            "reactive_step", duration_s=0.2)
 
     def _reactive_exploration_loop(self):
-        """Fallback reactive exploration (no Nav2) - now with doorway detection!"""
+        """Fallback reactive exploration (no Nav2) with doorway detection.
+
+        All velocity commands go through the arbiter via VelocityRequest.
+        """
         self.explore_mode = "reactive"
         last_observation = time.time() - self.look_interval + 5
         stuck_count = 0
         last_gap_attempt = 0
-        
-        self.get_logger().info("🚀 Reactive exploration with doorway detection")
-        
+
+        self.get_logger().info("Reactive exploration with doorway detection")
+
         while self.running and self.exploring:
             # Periodic observation — runs in background, does NOT stop movement
             if time.time() - last_observation >= self.look_interval:
                 last_observation = time.time()
                 threading.Thread(target=self._observe_in_background, daemon=True).start()
-            
-            # PRIORITY 1: Check for doorways/gaps and go through them!
+
+            # PRIORITY 1: Check for doorways/gaps and go through them
             if self.detected_gaps and time.time() - last_gap_attempt > 10:
                 best_gap = max(self.detected_gaps, key=lambda g: g['width'])
-                if best_gap['width'] >= 0.7 and best_gap['distance'] < 5.0:  # Good doorway!
-                    self.get_logger().info(f"🚪 Doorway spotted! Going through...")
+                if best_gap['width'] >= 0.7 and best_gap['distance'] < 5.0:
+                    self.get_logger().info("Doorway spotted! Going through...")
                     last_gap_attempt = time.time()
-                    self._random_exploration_walk()  # This now prioritizes gaps
+                    self._random_exploration_walk()
                     continue
-            
-            # Check if we need to turn away from obstacle FIRST
-            # Use narrow ±30° cone for exploration obstacle detection
+
+            # Check if we need to turn away from obstacle
             front_wide = self.obstacle_distances.get("front_wide", 10)
             min_front = front_wide
 
             if min_front < self.explore_obstacle_dist:
-                # Obstacle too close - turn away first!
                 stuck_count += 1
-                self.get_logger().warning(f"🔄 Obstacle at {min_front:.2f}m - turning away (attempt {stuck_count})")
+                self.get_logger().warning(
+                    f"Obstacle at {min_front:.2f}m - turning away (attempt {stuck_count})")
 
-                # Choose turn direction based on which side is clearer
                 left = self.obstacle_distances.get("left", 10)
                 right = self.obstacle_distances.get("right", 10)
 
                 if stuck_count > 3:
-                    # Escalate to smart exploration walk (gap detection + open space)
-                    self.get_logger().info("Stuck — escalating to smart exploration walk")
+                    self.get_logger().info("Stuck - escalating to smart exploration walk")
                     self._random_exploration_walk()
                     stuck_count = 0
                     continue
 
                 # Forward arc turn — Ackerman needs forward motion to steer
-                twist = Twist()
-                twist.linear.x = 0.08
+                ang = self.angular_speed * 1.5 if left > right else -self.angular_speed * 1.5
                 if left > right:
-                    twist.angular.z = self.angular_speed * 1.5  # Turn left
-                    self.get_logger().info(f"↰ Turning left (L:{left:.2f}m > R:{right:.2f}m)")
+                    self.get_logger().info(f"Turning left (L:{left:.2f}m > R:{right:.2f}m)")
                 else:
-                    twist.angular.z = -self.angular_speed * 1.5  # Turn right
-                    self.get_logger().info(f"↱ Turning right (R:{right:.2f}m > L:{left:.2f}m)")
+                    self.get_logger().info(f"Turning right (R:{right:.2f}m > L:{left:.2f}m)")
 
-                # Turn for a bit
-                for _ in range(20):  # 1 second of turning
-                    if not self.exploring or not self.running:
-                        break
-                    self.cmd_vel_pub.publish(twist)
-                    time.sleep(0.05)
+                # Turn for ~1 second via arbiter
+                self._publish_velocity_request(
+                    0.08, ang, VelocityRequest.PRIORITY_EXPLORATION,
+                    "reactive_turn", duration_s=1.0)
+                time.sleep(1.0)
 
                 # Stop and re-check
-                twist = Twist()
-                self.cmd_vel_pub.publish(twist)
+                self._publish_velocity_request(
+                    0, 0, VelocityRequest.PRIORITY_EXPLORATION,
+                    "reactive_stop", duration_s=0.2)
                 time.sleep(0.1)
-                continue  # Re-evaluate before moving forward
-            
-            # Clear ahead - reset stuck counter and move forward
+                continue
+
+            # Clear ahead — reset stuck counter and move forward
             stuck_count = 0
-            
-            # Move forward
+
             if self.exploring and self.running:
                 linear, angular = self.choose_exploration_direction()
                 self.move(linear, angular, 2.0)
-            
+
             time.sleep(0.05)
-        
-        twist = Twist()
-        self.cmd_vel_pub.publish(twist)
+
+        self._publish_velocity_request(
+            0, 0, VelocityRequest.PRIORITY_EXPLORATION,
+            "reactive_end", duration_s=0.5)
         self.get_logger().info("Reactive exploration ended")
 
     def _clear_costmaps(self):
@@ -3175,8 +3119,9 @@ Status:
         self.exploring = False
         self.explore_mode = "idle"
         self.explore_frontier_count = 0
-        twist = Twist()
-        self.cmd_vel_pub.publish(twist)
+        self._publish_velocity_request(
+            0, 0, VelocityRequest.PRIORITY_MANUAL, "stop_exploration",
+            duration_s=0.5)
         self.get_logger().info("Exploration stopped")
 
     # === Voice Loop ===
@@ -3200,7 +3145,9 @@ Status:
             was_llm_exploring = self.llm_exploring
             if was_llm_exploring:
                 self.llm_nav_paused.set()
-                self.cmd_vel_pub.publish(Twist())
+                self._publish_velocity_request(
+                    0, 0, VelocityRequest.PRIORITY_SAFETY, "voice_pause",
+                    duration_s=1.0)
 
             response = self.think(text)
             self.get_logger().info(f"Response: {response}")
@@ -3359,10 +3306,11 @@ Status:
         # Cleanup
         self.running = False
         self.exploring = False
-        
-        twist = Twist()
-        self.cmd_vel_pub.publish(twist)
-        
+
+        self._publish_velocity_request(
+            0, 0, VelocityRequest.PRIORITY_EMERGENCY, "shutdown",
+            duration_s=2.0)
+
         # Save discovery log
         self.discovery_log.save()
         
