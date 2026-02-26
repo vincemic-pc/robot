@@ -65,6 +65,17 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
+# LLM autonomous exploration modules (Plan 006)
+import queue
+from sensor_snapshot import (
+    SensorSnapshot, SensorSnapshotBuilder, compute_frame_similarity, EventTrigger,
+)
+from llm_navigator import LLMNavigator, NavigationDecision
+from safety_executor import (
+    SafetyExecutor, VelocityTarget, NavGoalTarget, ObserveTarget, StopTarget,
+)
+from exploration_memory import ExplorationMemory
+
 
 # === Camera and SLAM Configuration ===
 
@@ -389,7 +400,31 @@ class VoiceMapper(Node):
         # Maps directory
         self.maps_dir = Path("~/maps").expanduser()
         self.maps_dir.mkdir(parents=True, exist_ok=True)
-        
+
+        # LLM autonomous exploration (Plan 006)
+        self.snapshot_builder = SensorSnapshotBuilder(self)
+        self.llm_navigator = LLMNavigator(self.client)
+        self.safety_executor = SafetyExecutor()
+        self.exploration_memory = ExplorationMemory()
+        self.llm_exploring = False
+        self.llm_nav_paused = threading.Event()   # Set = paused
+        self.vlm_decision_queue = queue.Queue(maxsize=1)
+        self.last_vlm_velocity = Twist()          # Last VLM velocity target
+        self._vlm_thread = None
+        self._llm_control_thread = None
+        self._current_target = None               # Current target being applied
+        self._target_start_time = 0.0             # When current target started
+        self._observe_result = None               # Result from background observe
+        self._observing = False                   # True while background observe is running
+        self._last_vlm_frame = None               # Last frame sent to VLM (for similarity)
+        self._event_trigger = EventTrigger()      # Adaptive frequency event triggers (Phase 5)
+        self._vlm_trigger_event = threading.Event()  # Wake vlm_decision_loop early
+        # VLM decision frequency metrics (Phase 5, Task 5.5)
+        self._vlm_calls = 0
+        self._vlm_triggered_calls = 0
+        self._vlm_skipped_calls = 0
+        self._vlm_metrics_start = 0.0
+
         self.get_logger().info("Voice Mapper initialized!")
 
     def _find_microphone(self):
@@ -2024,65 +2059,79 @@ If the object is not visible, set found to false. Only respond with valid JSON."
         self.cmd_vel_pub.publish(twist)
         self.get_logger().info("🔄 U-turn complete!")
 
+    def _compute_safe_velocity(self, linear, angular):
+        """Apply obstacle-based safety scaling to a velocity command.
+
+        Encapsulates: emergency stop check, multi-sector front obstacle check,
+        backward obstacle check, proportional slowdown, and Ackerman minimum
+        forward speed constraint.
+
+        Returns (actual_linear, actual_angular, should_stop, stop_reason).
+        """
+        # Emergency stop check
+        if hasattr(self, 'emergency_stop_triggered') and self.emergency_stop_triggered:
+            return 0.0, 0.0, True, "emergency_stop"
+
+        front_dist = self.obstacle_distances.get("front", 10)
+        front_wide = self.obstacle_distances.get("front_wide", 10)
+        fl = self.obstacle_distances.get("front_left", 10)
+        fr = self.obstacle_distances.get("front_right", 10)
+        min_front = min(front_dist, front_wide, fl, fr)
+
+        # Forward obstacle check
+        if linear > 0 and min_front < self.min_obstacle_dist:
+            return 0.0, 0.0, True, f"obstacle_front_{min_front:.2f}m"
+
+        # Backward obstacle check
+        if linear < 0 and self.obstacles.get("back", False):
+            return 0.0, 0.0, True, "obstacle_back"
+
+        # Proportional slowdown
+        actual_linear = linear
+        if linear > 0 and min_front < self.slow_dist:
+            speed_factor = max(0.3, (min_front - self.min_obstacle_dist) / (self.slow_dist - self.min_obstacle_dist))
+            actual_linear = self.slow_speed * speed_factor
+
+        # Ackerman constraint: can't turn in place
+        if abs(angular) > 0.1 and abs(actual_linear) < 0.05:
+            actual_linear = 0.05 * (1 if linear >= 0 else -1)
+
+        return float(actual_linear), float(angular), False, ""
+
     def move(self, linear, angular, duration):
         """Move with robust obstacle avoidance"""
         twist = Twist()
         start_time = time.time()
         rate_hz = 20
-        
+
         while (time.time() - start_time) < duration and self.running:
-            # CRITICAL: Emergency stop check - anything dangerously close
-            if hasattr(self, 'emergency_stop_triggered') and self.emergency_stop_triggered:
-                self.get_logger().error("🚨 EMERGENCY: Object at {:.2f}m! Stopping!".format(
-                    self.obstacle_distances.get("front", 99)))
-                self.emergency_stop()
-                self.emergency_stop_triggered = False
-                # Back up slightly
-                self.get_logger().info("↩️ Backing up...")
-                backup_twist = Twist()
-                backup_twist.linear.x = -0.1
-                for _ in range(20):  # 1 second backup
-                    self.cmd_vel_pub.publish(backup_twist)
-                    time.sleep(0.05)
-                self.emergency_stop()
-                return
-            
-            # Safety checks - check multiple front sectors
-            front_dist = self.obstacle_distances.get("front", 10)
-            front_wide = self.obstacle_distances.get("front_wide", 10)
-            fl = self.obstacle_distances.get("front_left", 10)
-            fr = self.obstacle_distances.get("front_right", 10)
-            min_front = min(front_dist, front_wide, fl, fr)
-            
-            if linear > 0:
-                # Check for obstacle stop distance
-                if min_front < self.min_obstacle_dist:
-                    self.get_logger().warning(f"🛑 Obstacle at {min_front:.2f}m (F:{front_dist:.2f} FL:{fl:.2f} FR:{fr:.2f}) - stopping!")
+            actual_linear, actual_angular, should_stop, stop_reason = \
+                self._compute_safe_velocity(linear, angular)
+
+            if should_stop:
+                if stop_reason == "emergency_stop":
+                    self.get_logger().error("EMERGENCY: Object at {:.2f}m! Stopping!".format(
+                        self.obstacle_distances.get("front", 99)))
+                    self.emergency_stop()
+                    self.emergency_stop_triggered = False
+                    self.get_logger().info("Backing up...")
+                    backup_twist = Twist()
+                    backup_twist.linear.x = -0.1
+                    for _ in range(20):
+                        self.cmd_vel_pub.publish(backup_twist)
+                        time.sleep(0.05)
+                    self.emergency_stop()
+                    return
+                else:
+                    self.get_logger().warning(f"Obstacle stop: {stop_reason}")
                     break
-            
-            if linear < 0 and self.obstacles.get("back", False):
-                self.get_logger().warning("🛑 Obstacle behind - stopping!")
-                break
-            
-            # Speed control based on proximity
-            actual_linear = linear
-            if linear > 0:
-                if min_front < self.slow_dist:
-                    # Proportional slowdown
-                    speed_factor = max(0.3, (min_front - self.min_obstacle_dist) / (self.slow_dist - self.min_obstacle_dist))
-                    actual_linear = self.slow_speed * speed_factor
-                    self.get_logger().debug(f"Slowing: dist={min_front:.2f}m, factor={speed_factor:.2f}")
-            
-            # Ackerman constraint: can't turn in place
-            if abs(angular) > 0.1 and abs(actual_linear) < 0.05:
-                actual_linear = 0.05 * (1 if linear >= 0 else -1)
-            
-            twist.linear.x = float(actual_linear)
-            twist.angular.z = float(angular)
+
+            twist.linear.x = actual_linear
+            twist.angular.z = actual_angular
             self.cmd_vel_pub.publish(twist)
-            
+
             time.sleep(1.0 / rate_hz)
-        
+
         # Stop
         twist = Twist()
         self.cmd_vel_pub.publish(twist)
@@ -2275,6 +2324,8 @@ Status:
             self.navigate_to(x, y)
             
         elif action == "stop":
+            if self.llm_exploring:
+                self.stop_llm_exploration()
             self.stop_exploration()
             self.cancel_navigation()
             if speech:
@@ -2325,7 +2376,7 @@ Status:
             self.speak(speech)
 
     # === Exploration ===
-    
+
     def _observe_in_background(self):
         """Run observe() + speak() in a background thread without stopping navigation."""
         try:
@@ -2334,6 +2385,439 @@ Status:
                 self.speak(observation)
         except Exception as e:
             self.get_logger().warning(f"Background observation failed: {e}")
+
+    # --- LLM Autonomous Exploration (Plan 006) ---
+
+    def vlm_decision_loop(self):
+        """VLM decision thread: trigger -> snapshot -> decide -> enqueue.
+
+        Runs until self.llm_exploring is False.  Posts NavigationDecision
+        objects to self.vlm_decision_queue for the control loop to consume.
+
+        Phase 5: Uses event-driven waiting instead of fixed 5s timer.
+        EventTrigger checks at 10 Hz for doorway/intersection/dead-end/movement
+        events. Falls back to 5s base interval if no triggers fire.
+        """
+        base_interval = 5.0       # seconds — base rate fallback
+        safety_backstop = 10.0    # never skip if > 10s since last VLM call
+        trigger_poll_hz = 10      # Hz to poll EventTrigger
+        trigger_poll_s = 1.0 / trigger_poll_hz
+        last_call_time = 0.0
+
+        self.get_logger().info("VLM decision loop started (adaptive frequency)")
+
+        while self.llm_exploring and self.running:
+            # Check if paused by voice override
+            if self.llm_nav_paused.is_set():
+                time.sleep(0.1)
+                continue
+
+            # --- Event-driven waiting (Task 5.2) ---
+            # Poll EventTrigger at 10 Hz; break early if trigger fires or
+            # base interval elapses.  _vlm_trigger_event allows external wake.
+            triggered = False
+            trigger_reasons = []
+            while self.llm_exploring and self.running:
+                if self.llm_nav_paused.is_set():
+                    break
+                elapsed = time.time() - last_call_time
+                # Base interval fallback
+                if elapsed >= base_interval:
+                    break
+                # Check event triggers
+                trigger_reasons = self._event_trigger.check_triggers(
+                    self.obstacle_distances,
+                    self.detected_gaps,
+                    {'x': self.current_position['x'],
+                     'y': self.current_position['y']},
+                )
+                if trigger_reasons:
+                    triggered = True
+                    self.get_logger().info(
+                        "VLM trigger fired: %s", ", ".join(trigger_reasons))
+                    break
+                # External wake (e.g. from control loop on stuck detection)
+                if self._vlm_trigger_event.wait(timeout=trigger_poll_s):
+                    self._vlm_trigger_event.clear()
+                    triggered = True
+                    trigger_reasons = ["external_wake"]
+                    break
+
+            if not self.llm_exploring or not self.running:
+                break
+            if self.llm_nav_paused.is_set():
+                continue
+
+            try:
+                # Capture sensor snapshot
+                snapshot = self.snapshot_builder.capture()
+
+                # --- Enhanced frame similarity skipping (Task 5.3) ---
+                # Skip VLM call only when ALL three conditions are met:
+                #   1. Frame similarity > 0.92
+                #   2. No event trigger fired
+                #   3. Nearest obstacle > 2.0m
+                # Never skip if:
+                #   - Event trigger fired
+                #   - > safety_backstop since last VLM call
+                #   - Robot was recently stuck/overridden
+                current_frame = self.snapshot_builder.get_last_frame()
+                time_since_last = time.time() - last_call_time
+                skip_call = False
+
+                if (not triggered
+                        and time_since_last < safety_backstop
+                        and self._last_vlm_frame is not None
+                        and current_frame is not None):
+                    similarity = compute_frame_similarity(
+                        self._last_vlm_frame, current_frame)
+                    nearest_obstacle = min(
+                        self.obstacle_distances.get(k, 10.0)
+                        for k in ("front", "front_left", "front_right",
+                                  "left", "right"))
+                    if similarity > 0.92 and nearest_obstacle > 2.0:
+                        self._vlm_skipped_calls += 1
+                        self.get_logger().debug(
+                            "Skipping VLM: similarity=%.3f, nearest=%.1fm",
+                            similarity, nearest_obstacle)
+                        skip_call = True
+
+                if skip_call:
+                    time.sleep(0.5)
+                    continue
+
+                self._last_vlm_frame = current_frame
+
+                # Include previous observe result if available
+                if self._observe_result is not None:
+                    snapshot = SensorSnapshot(
+                        timestamp=snapshot.timestamp,
+                        annotated_image_b64=snapshot.annotated_image_b64,
+                        lidar_summary=snapshot.lidar_summary,
+                        doorway_gaps=snapshot.doorway_gaps,
+                        robot_state=snapshot.robot_state,
+                        affordance_scores=snapshot.affordance_scores,
+                        previous_action_result=self._observe_result,
+                    )
+                    self._observe_result = None
+
+                # --- Text-only fallback for clear corridors (Task 5.4) ---
+                skip_image = False
+                if (not triggered
+                        and self._last_vlm_frame is not None
+                        and current_frame is not None):
+                    corr_similarity = compute_frame_similarity(
+                        self._last_vlm_frame, current_frame)
+                    nearest = min(
+                        self.obstacle_distances.get(k, 10.0)
+                        for k in ("front", "front_left", "front_right",
+                                  "left", "right"))
+                    if corr_similarity > 0.95 and nearest > 3.0:
+                        skip_image = True
+                        self.get_logger().debug(
+                            "Text-only VLM call: similarity=%.3f, nearest=%.1fm",
+                            corr_similarity, nearest)
+
+                # Call VLM
+                t0 = time.time()
+                decision = self.llm_navigator.decide(
+                    snapshot, self.exploration_memory, skip_image=skip_image)
+                latency_ms = (time.time() - t0) * 1000.0
+
+                # Update network monitor
+                self.safety_executor.network_monitor.record_call(
+                    latency_ms, decision is not None)
+
+                # Update frequency metrics
+                self._vlm_calls += 1
+                if triggered:
+                    self._vlm_triggered_calls += 1
+
+                if decision is not None:
+                    # Feed watchdog (VLM responded)
+                    self.safety_executor.watchdog.feed()
+
+                    # Enqueue for control loop (drop old if full)
+                    try:
+                        self.vlm_decision_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self.vlm_decision_queue.put(decision)
+
+                    # Update exploration memory
+                    pos = self.current_position
+                    self.exploration_memory.update_after_action(
+                        decision,
+                        {'success': True},
+                        {'x': pos['x'], 'y': pos['y']},
+                    )
+
+                # Record position for event trigger
+                self._event_trigger.record_vlm_call(self.current_position)
+                last_call_time = time.time()
+
+                # --- Log VLM frequency metrics every 60s (Task 5.5) ---
+                self._log_vlm_metrics_if_due()
+
+            except Exception as e:
+                self.get_logger().error(f"VLM decision loop error: {e}")
+                self.safety_executor.network_monitor.record_call(0, False)
+                time.sleep(1.0)
+
+        self.get_logger().info("VLM decision loop ended")
+
+    def _log_vlm_metrics_if_due(self):
+        """Log VLM decision frequency metrics every 60 seconds (Task 5.5)."""
+        now = time.time()
+        elapsed = now - self._vlm_metrics_start
+        if elapsed < 60.0:
+            return
+
+        calls_per_min = self._vlm_calls
+        triggered_per_min = self._vlm_triggered_calls
+        skipped_per_min = self._vlm_skipped_calls
+        avg_latency = self.safety_executor.network_monitor.avg_latency_ms
+        tier = self.safety_executor.network_monitor.current_tier
+
+        self.get_logger().info(
+            "VLM stats: %d calls/min (%d triggered, %d skipped), "
+            "avg latency %.0fms, tier %d",
+            calls_per_min, triggered_per_min, skipped_per_min,
+            avg_latency, tier)
+
+        # Reset counters for next interval
+        self._vlm_calls = 0
+        self._vlm_triggered_calls = 0
+        self._vlm_skipped_calls = 0
+        self._vlm_metrics_start = now
+
+    def _run_observe_for_llm(self, focus):
+        """Background observe for LLM exploration (stores result for next VLM cycle)."""
+        try:
+            self._observing = True
+            observation, _ = self.observe()
+            self._observe_result = {
+                'success': observation is not None,
+                'observation': observation or "",
+                'focus': focus,
+            }
+            if observation:
+                self.speak(observation)
+        except Exception as e:
+            self.get_logger().warning(f"LLM observe failed: {e}")
+            self._observe_result = {'success': False, 'observation': '', 'focus': focus}
+        finally:
+            self._observing = False
+
+    def llm_control_loop(self):
+        """20 Hz local control loop — sole cmd_vel publisher during LLM exploration.
+
+        Dequeues VLM decisions, passes them through SafetyExecutor, and applies
+        velocity targets with real-time obstacle safety scaling.
+        """
+        rate_hz = 20
+        interval = 1.0 / rate_hz
+        self.get_logger().info("LLM control loop started (20 Hz)")
+
+        while self.llm_exploring and self.running:
+            loop_start = time.time()
+
+            # Voice override — stop robot while paused
+            if self.llm_nav_paused.is_set():
+                twist = Twist()
+                self.cmd_vel_pub.publish(twist)
+                time.sleep(interval)
+                continue
+
+            # Check for new VLM decision in queue
+            try:
+                decision = self.vlm_decision_queue.get_nowait()
+                result = self.safety_executor.execute_decision(
+                    decision, self, self.exploration_memory)
+
+                target = result.target
+
+                # Store action result for next snapshot
+                action_result = {
+                    'success': result.success,
+                    'safety_override': result.safety_override,
+                    'safety_message': result.safety_message,
+                }
+                if result.check_result:
+                    action_result['check_result'] = result.check_result
+                self.snapshot_builder.set_previous_action_result(action_result)
+
+                # Update exploration memory with result
+                pos = self.current_position
+                self.exploration_memory.update_after_action(
+                    decision, action_result,
+                    {'x': pos['x'], 'y': pos['y']},
+                )
+
+                if isinstance(target, VelocityTarget):
+                    self._current_target = target
+                    self._target_start_time = time.time()
+                elif isinstance(target, NavGoalTarget):
+                    self._current_target = target
+                    self._target_start_time = time.time()
+                elif isinstance(target, ObserveTarget):
+                    self._current_target = StopTarget(reason="observing")
+                    self._target_start_time = time.time()
+                    if not self._observing:
+                        threading.Thread(
+                            target=self._run_observe_for_llm,
+                            args=(target.focus,), daemon=True).start()
+                elif isinstance(target, StopTarget):
+                    self._current_target = target
+                    self._target_start_time = time.time()
+
+            except queue.Empty:
+                pass
+
+            # Apply current target
+            if self._current_target is None:
+                # No target yet — publish zero twist
+                self.cmd_vel_pub.publish(Twist())
+
+            elif isinstance(self._current_target, VelocityTarget):
+                elapsed = time.time() - self._target_start_time
+                if elapsed < self._current_target.duration_s:
+                    # Apply velocity with safety scaling
+                    raw_twist = self._current_target.twist
+                    actual_lin, actual_ang, should_stop, reason = \
+                        self._compute_safe_velocity(
+                            raw_twist.linear.x, raw_twist.angular.z)
+                    if should_stop:
+                        self.cmd_vel_pub.publish(Twist())
+                        self._current_target = StopTarget(reason=reason)
+                    else:
+                        twist = Twist()
+                        twist.linear.x = actual_lin
+                        twist.angular.z = actual_ang
+                        self.cmd_vel_pub.publish(twist)
+                else:
+                    # Duration expired — stop and wait for next decision
+                    self.cmd_vel_pub.publish(Twist())
+                    self._current_target = None
+
+            elif isinstance(self._current_target, NavGoalTarget):
+                # Nav2 is in control — don't publish cmd_vel while navigating
+                if not self.navigating:
+                    # Nav2 finished or failed — clear target
+                    self._current_target = None
+
+            elif isinstance(self._current_target, StopTarget):
+                self.cmd_vel_pub.publish(Twist())
+
+            # Watchdog check
+            tier = self.safety_executor.watchdog.evaluate()
+            if tier == "STOP_WAIT":
+                # Stop robot but keep LLM exploration alive
+                self.cmd_vel_pub.publish(Twist())
+            elif tier == "LOCAL_NAV":
+                # Fall back to frontier exploration (Task 4.8)
+                self.get_logger().warning(
+                    "VLM timeout — falling back to frontier exploration")
+                self.speak("Switching to autonomous mode")
+                self._fallback_to_frontier()
+                return
+            elif tier == "RETURN_HOME":
+                self.get_logger().warning("VLM timeout critical — returning home")
+                self.speak("Lost connection. Returning to start.")
+                self.navigate_to(0.0, 0.0)
+                self._fallback_to_frontier()
+                return
+
+            # Maintain loop rate
+            elapsed = time.time() - loop_start
+            sleep_time = interval - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        # Stopped — publish zero twist
+        self.cmd_vel_pub.publish(Twist())
+        self.get_logger().info("LLM control loop ended")
+
+    def _fallback_to_frontier(self):
+        """Switch from LLM exploration to frontier-based exploration."""
+        self.llm_exploring = False
+        self.explore_mode = "reactive"
+        self.cmd_vel_pub.publish(Twist())
+        # Start the existing frontier exploration loop
+        self.explore_thread = threading.Thread(
+            target=self.exploration_loop, daemon=True)
+        self.explore_thread.start()
+
+    def start_llm_exploration(self):
+        """Start LLM-driven autonomous exploration (VLM decision + control loops)."""
+        if self.llm_exploring:
+            return
+        self.llm_exploring = True
+        self.exploring = True
+        self.explore_mode = "llm"
+        self.llm_nav_paused.clear()
+        self._current_target = None
+        self._target_start_time = 0.0
+        self._last_vlm_frame = None
+        self._observe_result = None
+        self._observing = False
+
+        # Reset exploration tracking in snapshot builder
+        self.snapshot_builder.reset_exploration_tracking()
+
+        # Reset exploration memory with current position
+        pos = self.current_position
+        self.exploration_memory = ExplorationMemory(pos['x'], pos['y'])
+
+        # Clear watchdog / blocked memory / event triggers
+        self.safety_executor.watchdog.feed()
+        self.safety_executor.blocked_memory.clear()
+        self._event_trigger.reset()
+        self._vlm_trigger_event.clear()
+
+        # Reset VLM frequency metrics
+        self._vlm_calls = 0
+        self._vlm_triggered_calls = 0
+        self._vlm_skipped_calls = 0
+        self._vlm_metrics_start = time.time()
+
+        # Drain any stale decisions
+        while not self.vlm_decision_queue.empty():
+            try:
+                self.vlm_decision_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        # Start threads
+        self._vlm_thread = threading.Thread(
+            target=self.vlm_decision_loop, daemon=True)
+        self._llm_control_thread = threading.Thread(
+            target=self.llm_control_loop, daemon=True)
+        self._vlm_thread.start()
+        self._llm_control_thread.start()
+
+        self.get_logger().info("LLM exploration started")
+        self.speak("Starting intelligent exploration.")
+
+    def stop_llm_exploration(self):
+        """Stop LLM-driven exploration and clean up threads."""
+        if not self.llm_exploring:
+            return
+        self.llm_exploring = False
+        self.exploring = False
+        self.explore_mode = "idle"
+        self._current_target = None
+
+        # Stop robot immediately
+        self.cmd_vel_pub.publish(Twist())
+
+        # Wait for threads to finish (with timeout)
+        if self._vlm_thread and self._vlm_thread.is_alive():
+            self._vlm_thread.join(timeout=3.0)
+        if self._llm_control_thread and self._llm_control_thread.is_alive():
+            self._llm_control_thread.join(timeout=3.0)
+
+        self.get_logger().info("LLM exploration stopped")
 
     def exploration_loop(self):
         """Autonomous exploration using Nav2 frontier-based navigation.
@@ -2682,13 +3166,12 @@ Status:
     def start_exploration(self):
         if self.exploring:
             return
-        self.exploring = True
-        self.stuck_counter = 0
-        self.explore_thread = threading.Thread(target=self.exploration_loop, daemon=True)
-        self.explore_thread.start()
-        self.get_logger().info("🚀 Exploration started!")
+        # Use LLM-driven exploration (Plan 006)
+        self.start_llm_exploration()
 
     def stop_exploration(self):
+        if self.llm_exploring:
+            self.stop_llm_exploration()
         self.exploring = False
         self.explore_mode = "idle"
         self.explore_frontier_count = 0
@@ -2704,18 +3187,28 @@ Status:
             if self.speaking:
                 time.sleep(0.1)
                 continue
-            
+
             audio_file = self.listen()
             if not audio_file:
                 continue
-            
+
             text = self.transcribe(audio_file)
             if not text or len(text) < 2:
                 continue
-            
+
+            # Pause LLM navigation during voice command processing
+            was_llm_exploring = self.llm_exploring
+            if was_llm_exploring:
+                self.llm_nav_paused.set()
+                self.cmd_vel_pub.publish(Twist())
+
             response = self.think(text)
-            self.get_logger().info(f"🤖 {response}")
+            self.get_logger().info(f"Response: {response}")
             self.execute(response)
+
+            # Resume LLM navigation after voice command
+            if was_llm_exploring and self.llm_exploring:
+                self.llm_nav_paused.clear()
 
     # === Sensor Monitoring ===
     
