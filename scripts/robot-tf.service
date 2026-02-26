@@ -1,0 +1,21 @@
+[Unit]
+Description=Robot Static TF Publishers
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+User=jetson
+Group=jetson
+Environment="HOME=/home/jetson"
+ExecStart=/bin/bash /home/jetson/robot_scripts/run_tf.sh
+Restart=always
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=robot-tf
+
+[Install]
+WantedBy=robot.target

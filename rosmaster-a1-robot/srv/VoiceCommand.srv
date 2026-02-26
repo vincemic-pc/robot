@@ -1,0 +1,6 @@
+# VoiceCommand.srv
+
+string command
+---
+string response
+bool success

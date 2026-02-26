@@ -1,0 +1,15 @@
+numpy
+opencv-python
+rclpy
+sensor_msgs
+geometry_msgs
+nav_msgs
+tf2_ros
+pyaudio
+torch
+transformers
+depthai
+sllidar_ros2
+slam_toolbox
+isaac_ros_visual_slam
+```

@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+*.pyc
+
+# ROS2
+log/
+install/
+
+# IDE
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Secrets - NEVER commit API keys
+.rosmaster_llm_config
+*.env
+
+# Claude
+.claude/
+
+# Maps and logs (large/generated files)
+maps/*.pgm
+exploration_logs/*.yaml

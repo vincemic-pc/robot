@@ -1,0 +1,11 @@
+camera:
+  type: "OAK-D Pro"
+  resolution: 
+    width: 640
+    height: 480
+  fps: 30
+  depth_mode: "stereo"
+  ir_illumination: true
+  vslam_enabled: true
+  usb_bandwidth: "USB 3.0"
+  calibration_file: "path/to/calibration/file.yaml"

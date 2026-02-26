@@ -1,0 +1,33 @@
+# oakd_params_test.yaml — RGBD + explicit left/right publish (no synced pair)
+# synced_rect_pair causes double-free in depthai_ros_driver RGBD pipeline.
+# Instead: enable left.i_publish_topic + right.i_publish_topic for VSLAM input.
+# Also enable stereo.i_left_rect_publish_topic for rectified stereo output.
+/oak:
+  ros__parameters:
+    camera:
+      i_pipeline_type: RGBD
+      i_usb_speed: "SUPER"
+      i_enable_imu: true
+      i_enable_ir: false
+      i_nn_type: none
+    rgb:
+      i_resolution: "1080"
+      i_fps: 15.0
+      i_low_bandwidth: true
+      i_low_bandwidth_quality: 50
+    left:
+      i_resolution: "720"
+      i_fps: 15.0
+      i_low_bandwidth: false
+      i_publish_topic: true
+    right:
+      i_resolution: "720"
+      i_fps: 15.0
+      i_low_bandwidth: false
+      i_publish_topic: true
+    stereo:
+      i_publish_synced_rect_pair: false
+      i_left_rect_publish_topic: true
+      i_right_rect_publish_topic: true
+      i_reverse_stereo_socket_order: true
+      i_low_bandwidth: false

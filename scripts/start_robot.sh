@@ -5,6 +5,9 @@
 # ==============================================================================
 set -e
 
+echo "[start_robot.sh] WARNING: This script is deprecated. Use: sudo systemctl start robot.target"
+echo "[start_robot.sh] Running in legacy mode for backward compatibility."
+
 # ==============================================================================
 # 1. Source all ROS2 workspaces
 # ==============================================================================
@@ -34,10 +37,11 @@ BRINGUP_PID=""
 LIDAR_PID=""
 CAMERA_PID=""
 TF_PID=""
+VSLAM_PID=""
 
 cleanup() {
     echo "[start_robot.sh] Cleaning up background processes..."
-    kill $BRINGUP_PID $LIDAR_PID $CAMERA_PID $TF_PID 2>/dev/null || true
+    kill $BRINGUP_PID $LIDAR_PID $CAMERA_PID $TF_BASE_CAMERA_PID $TF_PID $VSLAM_PID 2>/dev/null || true
     wait 2>/dev/null || true
     echo "[start_robot.sh] Cleanup complete."
 }
@@ -62,9 +66,10 @@ sleep 2
 # 4c. Depth camera (OAK-D Pro via depthai-ros)
 #     Parameters delivered via YAML params_file (CLI key:=value overrides are
 #     silently ignored by camera.launch.py — it has no DeclareLaunchArgument).
-#     oakd_params.yaml sets: depth pipeline, USB 2.0 HIGH speed, stereo
-#     720P@10fps (raw), synced rect pair, IR off, no NN.
-#     RGB disabled to conserve USB 2.0 bandwidth (~17.6 MB/s stereo pair).
+#     oakd_params.yaml sets: RGBD pipeline, USB 3.0 SUPER speed, stereo
+#     720P@15fps (raw), RGB 1080P@15fps MJPEG, explicit L/R rect topics, IR off.
+#     CRITICAL: synced_rect_pair=false — true causes double-free crash in RGBD mode.
+#     USB 3.0 target: ~32 MB/s total (8% of VL822 5Gbps hub capacity).
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 echo "[start_robot.sh] Starting OAK-D Pro camera..."
 ros2 launch depthai_ros_driver camera.launch.py camera_model:=OAK-D-PRO \
@@ -123,7 +128,30 @@ else
 fi
 
 # ==============================================================================
-# 6. Launch voice_mapper.py
+# 6. Launch Isaac VSLAM (background)
+#    Requires stereo camera to be publishing. Uses oakd_vslam.launch.py which
+#    feeds mono8 rectified stereo directly to cuVSLAM (no CUDA converter).
+#    voice_mapper.py auto-detects VSLAM odometry and sets vslam_available=True.
+# ==============================================================================
+if [ -f ${SCRIPT_DIR}/oakd_vslam.launch.py ]; then
+    echo "[start_robot.sh] Starting Isaac VSLAM..."
+    ros2 launch ${SCRIPT_DIR}/oakd_vslam.launch.py &
+    VSLAM_PID=$!
+    sleep 5
+
+    # Quick check: is the VSLAM process still alive?
+    if kill -0 $VSLAM_PID 2>/dev/null; then
+        echo "[start_robot.sh] Isaac VSLAM launched (PID: $VSLAM_PID)"
+    else
+        echo "[start_robot.sh] WARNING: Isaac VSLAM process died. Continuing without VSLAM."
+        VSLAM_PID=""
+    fi
+else
+    echo "[start_robot.sh] oakd_vslam.launch.py not found — skipping VSLAM."
+fi
+
+# ==============================================================================
+# 7. Launch voice_mapper.py
 #    Run in foreground (not exec) so the EXIT trap fires on exit/signal,
 #    cleaning up background hardware processes. This works both under
 #    systemd (KillMode=mixed) and standalone invocation.

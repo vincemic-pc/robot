@@ -1,0 +1,21 @@
+[Unit]
+Description=Robot LiDAR (SLLidar C1)
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+User=jetson
+Group=jetson
+Environment="HOME=/home/jetson"
+ExecStart=/bin/bash /home/jetson/robot_scripts/run_lidar.sh
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=robot-lidar
+
+[Install]
+WantedBy=robot.target

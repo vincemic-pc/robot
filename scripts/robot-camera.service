@@ -1,0 +1,21 @@
+[Unit]
+Description=Robot Camera (OAK-D Pro)
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+[Service]
+Type=simple
+User=jetson
+Group=jetson
+Environment="HOME=/home/jetson"
+ExecStart=/bin/bash /home/jetson/robot_scripts/run_camera.sh
+Restart=always
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=robot-camera
+
+[Install]
+WantedBy=robot.target

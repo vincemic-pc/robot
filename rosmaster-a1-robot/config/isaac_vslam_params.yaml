@@ -1,0 +1,23 @@
+camera:
+  type: "oakd"
+  resolution: [640, 480]
+  fps: 30
+  depth_enabled: true
+  stereo_enabled: true
+
+vslam:
+  mode: "vslam"
+  tracking_quality: "high"
+  max_keyframes: 1000
+  min_keyframe_distance: 0.1
+  min_keyframe_rotation: 0.1
+
+optimization:
+  enable_bundle_adjustment: true
+  max_iterations: 50
+  convergence_threshold: 1e-6
+
+mapping:
+  enable_mapping: true
+  map_resolution: 0.05
+  map_size: [100, 100]

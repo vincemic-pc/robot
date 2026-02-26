@@ -1,0 +1,29 @@
+<package format="2">
+  <name>rosmaster_a1_robot</name>
+  <version>0.1.0</version>
+  <description>ROS2 package for Yahboom ROSMASTER A1 robot with voice control, navigation, and SLAM functionalities.</description>
+  <maintainer email="your_email@example.com">Your Name</maintainer>
+  <license>MIT</license>
+  
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>rclcpp</build_depend>
+  <build_depend>std_msgs</build_depend>
+  <build_depend>sensor_msgs</build_depend>
+  <build_depend>nav2_common</build_depend>
+  <build_depend>nav2_msgs</build_depend>
+  <build_depend>slam_toolbox</build_depend>
+  <build_depend>depthai_ros</build_depend>
+  <build_depend>isaac_ros_visual_slam</build_depend>
+  
+  <exec_depend>rclcpp</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>nav2_common</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+  <exec_depend>slam_toolbox</exec_depend>
+  <exec_depend>depthai_ros</exec_depend>
+  <exec_depend>isaac_ros_visual_slam</exec_depend>
+  
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+</package>

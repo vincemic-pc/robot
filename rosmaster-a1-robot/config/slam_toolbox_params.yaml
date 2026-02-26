@@ -1,0 +1,25 @@
+# Parameters for SLAM Toolbox
+
+slam_toolbox:
+  use_sim_time: false
+  frame_id: "map"
+  odom_frame_id: "odom"
+  base_frame_id: "base_link"
+  publish_frequency: 10.0
+  transform_timeout: 0.2
+  map_update_distance: 0.5
+  map_update_angle: 0.1
+  min_keyframe_distance: 1.0
+  min_keyframe_angle: 0.1
+  max_laser_range: 12.0
+  max_iterations: 100
+  linear_update: 0.1
+  angular_update: 0.1
+  loop_closure: true
+  loop_closure_distance: 5.0
+  loop_closure_angle: 0.1
+  use_laser_scan: true
+  use_imu: false
+  use_odometry: true
+  use_depth_camera: false
+  depth_camera_topic: "/oak/stereo/image_raw"

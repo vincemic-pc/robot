@@ -1,0 +1,25 @@
+[Unit]
+Description=Voice-Controlled Mapping Explorer
+After=robot-base.service robot-lidar.service robot-camera.service robot-tf.service robot-vslam.service
+Requires=robot-base.service robot-lidar.service robot-tf.service
+Wants=robot-camera.service robot-vslam.service
+
+[Service]
+Type=simple
+User=jetson
+Group=jetson
+Environment="HOME=/home/jetson"
+Environment="DISPLAY=:0"
+Environment="PULSE_SERVER=unix:/run/user/1000/pulse/native"
+EnvironmentFile=/home/jetson/.rosmaster_llm_env
+ExecStart=/bin/bash /home/jetson/robot_scripts/run_voice_mapper.sh
+Restart=on-failure
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=robot-voice-mapper
+
+[Install]
+WantedBy=robot.target

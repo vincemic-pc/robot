@@ -1,0 +1,25 @@
+[Unit]
+Description=Isaac VSLAM (Visual SLAM - Optional)
+After=robot-camera.service
+Wants=robot-camera.service
+# Skip cleanly if launch file doesn't exist on this deployment
+ConditionPathExists=/home/jetson/robot_scripts/oakd_vslam.launch.py
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+User=jetson
+Group=jetson
+Environment="HOME=/home/jetson"
+ExecStart=/bin/bash /home/jetson/robot_scripts/run_vslam.sh
+Restart=on-failure
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=robot-vslam
+
+[Install]
+WantedBy=robot.target

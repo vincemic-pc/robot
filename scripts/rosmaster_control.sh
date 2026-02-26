@@ -304,70 +304,70 @@ run_yahboom_explorer() {
     python3 yahboom_explorer.py
 }
 
-# === Service Management (merged from install_service.sh) ===
+# === Service Management (multi-service systemd architecture) ===
 
-SERVICE_NAME="voice_mapper"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+SCRIPT_DIR_ROBOT="/home/jetson/robot_scripts"
+SYSTEMD_DIR="/etc/systemd/system"
+ROBOT_SERVICES="robot-base robot-lidar robot-camera robot-tf robot-vslam robot-voice-mapper"
+ROBOT_TARGET="robot.target"
 
 service_install() {
-    print_info "Installing ${SERVICE_NAME} systemd service..."
-    
+    print_info "Installing robot systemd services..."
+
     if [ "$EUID" -ne 0 ]; then
         print_error "Please run with sudo: sudo $0 service install"
         exit 1
     fi
-    
+
     # Check dependencies
-    if [ ! -f "/home/jetson/robot_scripts/voice_mapper.py" ]; then
-        print_error "voice_mapper.py not found in /home/jetson/robot_scripts/"
+    if [ ! -f "${SCRIPT_DIR_ROBOT}/voice_mapper.py" ]; then
+        print_error "voice_mapper.py not found in ${SCRIPT_DIR_ROBOT}/"
         exit 1
     fi
-    
+
     if [ ! -f "/home/jetson/.rosmaster_llm_config" ]; then
         print_error "OpenAI config not found: /home/jetson/.rosmaster_llm_config"
         exit 1
     fi
-    
-    # Create systemd-compatible env file
+
+    # Create systemd-compatible env file (strip 'export ' prefix)
     sed 's/export //' /home/jetson/.rosmaster_llm_config > /home/jetson/.rosmaster_llm_env
     chown jetson:jetson /home/jetson/.rosmaster_llm_env
-    
-    # Create service file
-    cat > "$SERVICE_FILE" << 'SERVICEEOF'
-[Unit]
-Description=Voice-Controlled Mapping Explorer Robot
-After=network.target sound.target
-Wants=network.target
 
-[Service]
-Type=simple
-User=jetson
-Group=jetson
-Environment="HOME=/home/jetson"
-Environment="ROS_DOMAIN_ID=62"
-Environment="DISPLAY=:0"
-Environment="PULSE_SERVER=unix:/run/user/1000/pulse/native"
-EnvironmentFile=/home/jetson/.rosmaster_llm_env
-ExecStart=/bin/bash /home/jetson/robot_scripts/start_robot.sh
-Restart=on-failure
-RestartSec=10
-TimeoutStopSec=10
-KillMode=mixed
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=voice_mapper
+    # Make wrapper scripts executable
+    chmod +x ${SCRIPT_DIR_ROBOT}/ros2_env.sh ${SCRIPT_DIR_ROBOT}/run_*.sh 2>/dev/null || true
 
-[Install]
-WantedBy=multi-user.target
-SERVICEEOF
-    
+    # Remove old monolithic service if present
+    if [ -f "${SYSTEMD_DIR}/voice_mapper.service" ]; then
+        print_info "Removing old monolithic voice_mapper.service..."
+        systemctl stop voice_mapper 2>/dev/null || true
+        systemctl disable voice_mapper 2>/dev/null || true
+        rm -f "${SYSTEMD_DIR}/voice_mapper.service"
+    fi
+
+    # Install service files and target
+    for svc in $ROBOT_SERVICES; do
+        if [ -f "${SCRIPT_DIR_ROBOT}/${svc}.service" ]; then
+            cp "${SCRIPT_DIR_ROBOT}/${svc}.service" "${SYSTEMD_DIR}/"
+            print_info "  Installed ${svc}.service"
+        else
+            print_error "  Missing ${svc}.service in ${SCRIPT_DIR_ROBOT}/"
+        fi
+    done
+
+    cp "${SCRIPT_DIR_ROBOT}/${ROBOT_TARGET}" "${SYSTEMD_DIR}/"
+    print_info "  Installed ${ROBOT_TARGET}"
+
     systemctl daemon-reload
-    systemctl enable "$SERVICE_NAME"
-    systemctl start "$SERVICE_NAME"
-    
-    print_info "Service installed and started!"
-    print_info "Commands: sudo systemctl [status|stop|start|restart] $SERVICE_NAME"
-    print_info "Logs: journalctl -u $SERVICE_NAME -f"
+    systemctl enable "$ROBOT_TARGET"
+    systemctl start "$ROBOT_TARGET"
+
+    print_info "All robot services installed and started!"
+    print_info "Commands:"
+    print_info "  sudo systemctl [start|stop|restart] robot.target   (all services)"
+    print_info "  sudo systemctl [start|stop|restart] robot-camera   (single service)"
+    print_info "  journalctl -u 'robot-*' -f                         (all logs)"
+    print_info "  journalctl -u robot-camera -f                      (single service log)"
 }
 
 service_uninstall() {
@@ -375,33 +375,51 @@ service_uninstall() {
         print_error "Please run with sudo"
         exit 1
     fi
-    
-    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
-    systemctl disable "$SERVICE_NAME" 2>/dev/null || true
-    rm -f "$SERVICE_FILE"
+
+    systemctl stop "$ROBOT_TARGET" 2>/dev/null || true
+    systemctl disable "$ROBOT_TARGET" 2>/dev/null || true
+
+    for svc in $ROBOT_SERVICES; do
+        systemctl stop "$svc" 2>/dev/null || true
+        systemctl disable "$svc" 2>/dev/null || true
+        rm -f "${SYSTEMD_DIR}/${svc}.service"
+    done
+    rm -f "${SYSTEMD_DIR}/${ROBOT_TARGET}"
+
+    # Also remove old monolithic service if present
+    rm -f "${SYSTEMD_DIR}/voice_mapper.service"
+
     systemctl daemon-reload
-    print_info "Service uninstalled"
+    print_info "All robot services uninstalled"
 }
 
 service_status() {
-    systemctl status "$SERVICE_NAME" --no-pager
+    echo ""
+    systemctl status "$ROBOT_TARGET" --no-pager 2>/dev/null || true
+    echo ""
+    for svc in $ROBOT_SERVICES; do
+        systemctl status "$svc" --no-pager --lines=3 2>/dev/null || true
+        echo ""
+    done
 }
 
 service_logs() {
-    journalctl -u "$SERVICE_NAME" -f
+    journalctl -u 'robot-*' -f
 }
 
 service_cmd() {
     case "${1:-status}" in
         install)   service_install ;;
         uninstall) service_uninstall ;;
-        start)     sudo systemctl start "$SERVICE_NAME" && service_status ;;
-        stop)      sudo systemctl stop "$SERVICE_NAME" ;;
-        restart)   sudo systemctl restart "$SERVICE_NAME" && service_status ;;
+        start)     sudo systemctl start "$ROBOT_TARGET" && service_status ;;
+        stop)      sudo systemctl stop "$ROBOT_TARGET" ;;
+        restart)   sudo systemctl restart "$ROBOT_TARGET" && service_status ;;
         status)    service_status ;;
         logs)      service_logs ;;
         *)
             echo "Service commands: install, uninstall, start, stop, restart, status, logs"
+            echo "  All services managed via robot.target"
+            echo "  Individual: sudo systemctl restart robot-camera"
             ;;
     esac
 }
