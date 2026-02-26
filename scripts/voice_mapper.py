@@ -357,6 +357,10 @@ class VoiceMapper(Node):
         
         # Exploration settings
         self.look_interval = 15.0
+        self.explore_obstacle_dist = 0.3  # Exploration obstacle threshold (matches emergency_dist)
+        self.explore_mode = "idle"            # "idle" | "nav2-frontier" | "reactive" | "random-walk"
+        self.last_meaningful_movement = 0.0   # timestamp of last position change > 0.3m
+        self.explore_frontier_count = 0       # frontiers found in last check
         self.path_record_interval = 0.5
         self.last_path_record = 0
         self.stuck_counter = 0
@@ -450,6 +454,30 @@ class VoiceMapper(Node):
         
         self.get_logger().info("Nav2 clients initialized (will connect when Nav2 starts)")
 
+    def _kill_stale_nav2(self):
+        """Kill any pre-existing Nav2 processes from a previous voice_mapper instance.
+        Without this, a second Nav2 stack launches on top of the first and the
+        lifecycle managers conflict, leaving bt_navigator in 'unconfigured' state
+        which causes every navigation goal to be rejected.
+        """
+        try:
+            result = subprocess.run(
+                ["pkill", "-f", "nav2_bringup.*navigation_launch"],
+                capture_output=True, timeout=5
+            )
+            if result.returncode == 0:
+                self.get_logger().info("Killed stale Nav2 launch processes")
+                time.sleep(1)
+            # Also kill individual Nav2 nodes that may have been orphaned
+            for node in ["bt_navigator", "controller_server", "planner_server",
+                         "behavior_server", "smoother_server", "waypoint_follower",
+                         "velocity_smoother", "lifecycle_manager"]:
+                subprocess.run(["pkill", "-f", f"nav2.*{node}"],
+                               capture_output=True, timeout=3)
+            time.sleep(2)  # Let processes die and DDS discover the change
+        except Exception as e:
+            self.get_logger().warning(f"Stale Nav2 cleanup warning: {e}")
+
     def start_nav2(self):
         """Launch Nav2 stack with our config"""
         if self.nav2_process is not None:
@@ -457,6 +485,9 @@ class VoiceMapper(Node):
             return True
         
         self.get_logger().info("🚀 Starting Nav2 navigation stack...")
+        
+        # Kill any stale Nav2 from a previous voice_mapper instance
+        self._kill_stale_nav2()
         
         # Check if we have a map
         if self.latest_map is None:
@@ -482,14 +513,29 @@ class VoiceMapper(Node):
             
             self.get_logger().info("Nav2 launch started, waiting for action servers...")
             
-            # Wait for Nav2 to be ready
-            for i in range(30):  # 30 second timeout
+            # Wait for Nav2 to be ready — need bt_navigator active, not just
+            # the action server existing (a stale server may respond but reject goals)
+            for i in range(60):  # 60 second timeout (lifecycle transitions take time)
                 if self.nav_to_pose_client.wait_for_server(timeout_sec=1.0):
-                    self.nav2_available = True
-                    self.get_logger().info("✅ Nav2 is ready!")
-                    self.beep("success")
-                    return True
-                self.get_logger().info(f"Waiting for Nav2... ({i+1}/30)")
+                    # Action server exists — verify bt_navigator is active
+                    try:
+                        check = subprocess.run(
+                            ["ros2", "lifecycle", "get", "/bt_navigator"],
+                            capture_output=True, text=True, timeout=5,
+                            env={**os.environ, 'ROS_DOMAIN_ID': '62'}
+                        )
+                        if "active" in check.stdout:
+                            self.nav2_available = True
+                            self.get_logger().info("✅ Nav2 is ready (bt_navigator active)!")
+                            self.beep("success")
+                            return True
+                        else:
+                            state = check.stdout.strip().split('\n')[-1] if check.stdout.strip() else "unknown"
+                            self.get_logger().info(f"Waiting for bt_navigator to activate... (currently: {state}) ({i+1}/60)")
+                    except Exception:
+                        self.get_logger().info(f"Waiting for Nav2 lifecycle... ({i+1}/60)")
+                else:
+                    self.get_logger().info(f"Waiting for Nav2 action server... ({i+1}/60)")
             
             self.get_logger().error("❌ Nav2 failed to start within timeout")
             self.beep("error")
@@ -600,114 +646,123 @@ class VoiceMapper(Node):
         """Find frontier points from the current map for exploration.
         Frontiers are edges between known (free) and unknown space.
         Prioritizes larger frontiers which often indicate doorways to new rooms.
+        Uses vectorized numpy operations for speed on large maps.
         """
         if self.latest_map is None:
             self.get_logger().warning("No map available for frontier detection")
             return []
-        
+
         map_data = np.array(self.latest_map.data).reshape(
             (self.latest_map.info.height, self.latest_map.info.width))
-        
+
         resolution = self.latest_map.info.resolution
         origin_x = self.latest_map.info.origin.position.x
         origin_y = self.latest_map.info.origin.position.y
-        
-        # Find all frontier cells (free cells adjacent to unknown)
-        frontier_cells = []
-        
-        for i in range(2, map_data.shape[0] - 2):
-            for j in range(2, map_data.shape[1] - 2):
-                if map_data[i, j] == 0:  # Free cell
-                    # Check 8-connected neighbors for unknown (-1)
-                    has_unknown = False
-                    has_free = False
-                    for di in [-1, 0, 1]:
-                        for dj in [-1, 0, 1]:
-                            if di == 0 and dj == 0:
-                                continue
-                            neighbor = map_data[i + di, j + dj]
-                            if neighbor == -1:
-                                has_unknown = True
-                            elif neighbor == 0:
-                                has_free = True
-                    
-                    # Frontier: free cell with unknown neighbor and at least one free neighbor
-                    if has_unknown and has_free:
-                        world_x = origin_x + j * resolution
-                        world_y = origin_y + i * resolution
-                        frontier_cells.append((world_x, world_y))
-        
-        self.get_logger().info(f"Found {len(frontier_cells)} raw frontier cells")
-        
-        if len(frontier_cells) == 0:
+
+        # Vectorized frontier detection: free cells (0) adjacent to unknown (-1)
+        free = map_data == 0
+        unknown = map_data == -1
+
+        # Check 8-connected neighbors for unknown using shifts
+        unknown_neighbor = np.zeros_like(free)
+        for di in [-1, 0, 1]:
+            for dj in [-1, 0, 1]:
+                if di == 0 and dj == 0:
+                    continue
+                shifted = np.roll(np.roll(unknown, di, axis=0), dj, axis=1)
+                unknown_neighbor |= shifted
+
+        # Frontier: free cell with at least one unknown neighbor
+        frontier_mask = free & unknown_neighbor
+
+        # Zero out border cells (unreliable)
+        frontier_mask[:2, :] = False
+        frontier_mask[-2:, :] = False
+        frontier_mask[:, :2] = False
+        frontier_mask[:, -2:] = False
+
+        frontier_ij = np.argwhere(frontier_mask)  # (N, 2) array of [row, col]
+
+        self.get_logger().info(f"Found {len(frontier_ij)} raw frontier cells")
+
+        if len(frontier_ij) == 0:
             return []
-        
-        # Cluster frontiers - larger clusters are better (doorways, corridors)
-        clusters = self._cluster_frontiers_advanced(frontier_cells, resolution)
-        
+
+        # Cluster frontiers using spatial hashing (O(n) instead of O(n^2))
+        clusters = self._cluster_frontiers_grid(frontier_ij, resolution, origin_x, origin_y)
+
         self.get_logger().info(f"Clustered into {len(clusters)} frontier regions")
-        
+
         return clusters
 
-    def _cluster_frontiers_advanced(self, frontier_cells, resolution, min_cluster_size=3):
-        """Cluster frontier cells and rank by size and potential.
-        Larger clusters often indicate doorways to unexplored rooms.
+    def _cluster_frontiers_grid(self, frontier_ij, resolution, origin_x, origin_y,
+                                min_cluster_size=3, cell_radius=5):
+        """Cluster frontier cells using grid-cell grouping.
+        Assigns each frontier cell to a coarse grid bucket, then merges
+        adjacent buckets via flood-fill. O(n) vs the old O(n^2) BFS.
         """
-        if not frontier_cells:
+        if len(frontier_ij) == 0:
             return []
-        
-        # Use simple distance-based clustering
-        cluster_dist = resolution * 5  # Cells within 5 grid cells
+
+        # Assign each cell to a coarse grid bucket (cell_radius x cell_radius)
+        bucket_ij = frontier_ij // cell_radius  # integer division
+        # Build bucket → list of frontier indices
+        buckets = {}
+        for idx in range(len(frontier_ij)):
+            key = (int(bucket_ij[idx, 0]), int(bucket_ij[idx, 1]))
+            if key not in buckets:
+                buckets[key] = []
+            buckets[key].append(idx)
+
+        # Flood-fill adjacent buckets to form clusters
+        visited_buckets = set()
         clusters = []
-        used = set()
-        
-        for i, (x, y) in enumerate(frontier_cells):
-            if i in used:
+
+        for start_key in buckets:
+            if start_key in visited_buckets:
                 continue
-            
-            # Start new cluster
-            cluster = [(x, y)]
-            used.add(i)
-            
-            # Find all connected frontier cells
-            queue = [i]
+
+            # BFS over bucket grid (only visits occupied buckets)
+            cluster_indices = []
+            queue = [start_key]
+            visited_buckets.add(start_key)
+
             while queue:
-                current = queue.pop(0)
-                cx, cy = frontier_cells[current]
-                
-                for j, (x2, y2) in enumerate(frontier_cells):
-                    if j in used:
-                        continue
-                    dist = math.sqrt((cx - x2)**2 + (cy - y2)**2)
-                    if dist < cluster_dist:
-                        cluster.append((x2, y2))
-                        used.add(j)
-                        queue.append(j)
-            
-            # Only keep clusters above minimum size (filters noise)
-            if len(cluster) >= min_cluster_size:
-                # Calculate centroid
-                cx = sum(p[0] for p in cluster) / len(cluster)
-                cy = sum(p[1] for p in cluster) / len(cluster)
-                clusters.append({
-                    'x': cx,
-                    'y': cy,
-                    'size': len(cluster),
-                    'points': cluster
-                })
-        
+                bk = queue.pop(0)
+                cluster_indices.extend(buckets[bk])
+
+                # Check 8-connected neighbor buckets
+                for di in [-1, 0, 1]:
+                    for dj in [-1, 0, 1]:
+                        if di == 0 and dj == 0:
+                            continue
+                        neighbor = (bk[0] + di, bk[1] + dj)
+                        if neighbor in buckets and neighbor not in visited_buckets:
+                            visited_buckets.add(neighbor)
+                            queue.append(neighbor)
+
+            if len(cluster_indices) < min_cluster_size:
+                continue
+
+            # Compute centroid in world coordinates
+            rows = frontier_ij[cluster_indices, 0]
+            cols = frontier_ij[cluster_indices, 1]
+            cx = origin_x + np.mean(cols) * resolution
+            cy = origin_y + np.mean(rows) * resolution
+            clusters.append((float(cx), float(cy), len(cluster_indices)))
+
         # Sort by size (larger = more interesting, likely doorways)
-        clusters.sort(key=lambda c: c['size'], reverse=True)
-        
-        # Return as (x, y, size) tuples
-        return [(c['x'], c['y'], c['size']) for c in clusters]
+        clusters.sort(key=lambda c: c[2], reverse=True)
+
+        return clusters
 
     def choose_frontier(self):
         """Choose best frontier to explore - prioritizes discovery of new areas.
         Strategy: Balance between exploration (large distant frontiers) and efficiency.
         """
         frontiers = self.find_frontiers()
-        
+        self.explore_frontier_count = len(frontiers)
+
         if not frontiers:
             self.get_logger().info("No frontiers found - map may be complete")
             return None
@@ -815,8 +870,9 @@ COMMANDS (respond with JSON):
    - angular: -0.5 to 0.5 rad/s (turning rate)
    - duration: up to 15 seconds
    - For large turns (90°+), use high angular (0.4-0.5) and enough duration
-   - 90° turn ≈ angular 0.5 for 3.5s, 180° ≈ angular 0.5 for 7s
-   - Robot has Ackerman steering: it drives a small arc while turning, it cannot spin in place
+   - 90° turn ≈ linear 0.08 + angular 0.5 for 3.5s, 180° ≈ use turn_around action instead
+   - Robot has Ackerman steering: ALWAYS include linear >= 0.05 when angular != 0 (it cannot spin in place)
+   - NEVER set linear to 0 with non-zero angular — the robot needs forward motion to turn
 
 1b. Turn Around (U-turn): {"action": "turn_around", "speech": "Turning around!"}
    - Executes a 3-point U-turn (forward arc, reverse arc, forward arc)
@@ -949,7 +1005,12 @@ Always respond with valid JSON. Keep speech short (1-2 sentences)."""
         
         # Replace inf/nan with max range (indicates open space, not obstacle!)
         max_range = msg.range_max if msg.range_max > 0 else 12.0
-        ranges_clean = np.where(np.isinf(ranges) | np.isnan(ranges), max_range, ranges)
+        # Filter self-body reflections: readings below the sensor's minimum
+        # reliable range are the LiDAR seeing the robot's own chassis/bumper
+        min_range = max(msg.range_min, 0.12) if msg.range_min > 0 else 0.12
+        ranges_clean = np.where(
+            np.isinf(ranges) | np.isnan(ranges) | (ranges < min_range),
+            max_range, ranges)
         
         # LiDAR has 720 points covering 360°
         # Index 0 = front (0°), going counter-clockwise
@@ -1000,10 +1061,13 @@ Always respond with valid JSON. Keep speech short (1-2 sentences)."""
                 
                 self.obstacles[sector] = is_blocked
         
-        # Wide front arc for emergency stop (combine front sectors)
-        front_wide_start = num_points - front_points  # -45°
-        front_wide_end = front_points * 2  # +90°
-        front_wide = np.concatenate([ranges_clean[front_wide_start:], ranges_clean[:front_wide_end]])
+        # Narrow front arc for emergency stop: ±30° (not the full ±45°/+90°)
+        # Side objects at 60-90° should NOT trigger emergency stop for forward motion
+        emergency_half_angle = 30  # degrees
+        emergency_points = int(emergency_half_angle / angle_per_point)
+        emergency_start = num_points - emergency_points  # -30°
+        emergency_end = emergency_points  # +30°
+        front_wide = np.concatenate([ranges_clean[emergency_start:], ranges_clean[:emergency_end]])
         self.min_front_distance = np.percentile(front_wide, 5) if len(front_wide) > 0 else max_range
         self.obstacle_distances["front_wide"] = self.min_front_distance
         
@@ -1011,13 +1075,15 @@ Always respond with valid JSON. Keep speech short (1-2 sentences)."""
         # Look for gaps: sequences where distance jumps significantly (doorways!)
         self._detect_doorways(ranges_clean, num_points, angle_per_point)
         
-        # Emergency stop check
+        # Emergency stop check — only for manual movement, not during exploration
+        # (exploration has its own obstacle handling via Nav2 and reactive fallback)
         if self.min_front_distance < self.emergency_dist:
-            self.get_logger().error(f"🛑 EMERGENCY: Object at {self.min_front_distance:.2f}m!")
-            self.emergency_stop_triggered = True
-            if self.exploring:
-                twist = Twist()
-                self.cmd_vel_pub.publish(twist)
+            if not self.exploring:
+                self.get_logger().error(f"🛑 EMERGENCY: Object at {self.min_front_distance:.2f}m!")
+                self.emergency_stop_triggered = True
+            elif not hasattr(self, '_last_emergency_log') or time.time() - self._last_emergency_log > 5:
+                self._last_emergency_log = time.time()
+                self.get_logger().warning(f"⚠️ Close object at {self.min_front_distance:.2f}m (exploration active, Nav2 handles avoidance)")
     
     def _detect_doorways(self, ranges, num_points, angle_per_point):
         """Detect doorways/gaps in LiDAR data - openings where distance suddenly increases."""
@@ -1411,6 +1477,12 @@ If the object is not visible, set found to false. Only respond with valid JSON."
         """
         if self.vslam_process is not None:
             self.get_logger().warning("Isaac VSLAM already running")
+            return True
+        
+        # Detect externally-launched VSLAM (e.g. by start_robot.sh)
+        if self.vslam_tracking:
+            self.get_logger().info("✅ Isaac VSLAM already running externally — adopting")
+            self.vslam_available = True
             return True
         
         # Check camera compatibility - need stereo topics for VSLAM
@@ -1819,6 +1891,12 @@ If the object is not visible, set found to false. Only respond with valid JSON."
         """Look and describe surroundings"""
         if not self.latest_image:
             return "Camera not available.", None
+
+        # Reject stale images — camera may have disconnected
+        if self.latest_image_time and (time.time() - self.latest_image_time) > 5.0:
+            self.get_logger().warning("Rejecting stale image (%.1fs old)",
+                                     time.time() - self.latest_image_time)
+            return "Camera not available — image is stale.", None
         
         image_b64, cv_image = self.image_to_base64(self.latest_image)
         if not image_b64:
@@ -2011,27 +2089,26 @@ If the object is not visible, set found to false. Only respond with valid JSON."
 
     def choose_exploration_direction(self):
         """Smart direction for mapping exploration with safety margins"""
-        front = self.obstacle_distances.get("front", 10)
         front_wide = self.obstacle_distances.get("front_wide", 10)
         front_left = self.obstacle_distances.get("front_left", 10)
         front_right = self.obstacle_distances.get("front_right", 10)
         left = self.obstacle_distances.get("left", 10)
         right = self.obstacle_distances.get("right", 10)
-        
-        # Use minimum of front sensors for safety
-        min_front = min(front, front_wide, front_left, front_right)
-        
-        self.get_logger().debug(f"Explore check: F:{front:.2f} FW:{front_wide:.2f} FL:{front_left:.2f} FR:{front_right:.2f}")
-        
+
+        # Use narrow ±30° cone consistent with other exploration functions
+        min_front = front_wide
+
+        self.get_logger().debug(f"Explore check: FW:{front_wide:.2f} FL:{front_left:.2f} FR:{front_right:.2f}")
+
         # If anything close, turn away from it
-        if min_front < self.min_obstacle_dist:
-            # Too close - need to turn sharply
+        if min_front < self.explore_obstacle_dist:
+            # Too close - need to turn sharply (Ackerman needs forward motion to turn)
             if front_left > front_right:
                 self.get_logger().info(f"↰ Turning left (obstacle at {min_front:.2f}m)")
-                return (0.0, self.angular_speed * 1.2)  # Sharper turn, slower
+                return (0.06, self.angular_speed * 1.2)  # Minimum forward speed for Ackerman
             else:
                 self.get_logger().info(f"↱ Turning right (obstacle at {min_front:.2f}m)")
-                return (0.0, -self.angular_speed * 1.2)
+                return (0.06, -self.angular_speed * 1.2)
         
         # Prefer unexplored directions (sides with more space)
         if min_front > self.slow_dist:
@@ -2067,7 +2144,16 @@ Status:
 """
         if self.map_info:
             context += f"- Map size: {self.map_info['width']}x{self.map_info['height']} cells\n"
-        
+
+        if self.exploring:
+            time_since_move = time.time() - self.last_meaningful_movement if self.last_meaningful_movement else 0
+            nav2_status = "active" if self.nav2_available else "unavailable"
+            stuck = time_since_move > 30
+            context += f"- Nav2: {nav2_status}\n"
+            context += f"- Explore mode: {self.explore_mode}\n"
+            context += f"- Frontiers found: {self.explore_frontier_count}\n"
+            context += f"- Exploration progress: {'stuck' if stuck else 'moving'}\n"
+
         return context
 
     def think(self, user_input):
@@ -2240,19 +2326,30 @@ Status:
 
     # === Exploration ===
     
+    def _observe_in_background(self):
+        """Run observe() + speak() in a background thread without stopping navigation."""
+        try:
+            observation, _ = self.observe()
+            if observation:
+                self.speak(observation)
+        except Exception as e:
+            self.get_logger().warning(f"Background observation failed: {e}")
+
     def exploration_loop(self):
         """Autonomous exploration using Nav2 frontier-based navigation.
         Aggressively explores to discover new rooms and go through doorways.
         """
+        self.explore_mode = "nav2-frontier"
         last_observation = time.time() - self.look_interval + 5
         consecutive_failures = 0
         max_failures = 5
         no_frontier_count = 0
         exploration_start = time.time()
-        
+
+        self.last_meaningful_movement = time.time()
         self.get_logger().info("🚀 Starting adventurous exploration!")
         self.speak("Starting exploration! I'll look for new rooms and doorways.")
-        
+
         # Start Nav2 if not running
         if not self.nav2_available:
             self.get_logger().info("Starting Nav2 for exploration...")
@@ -2261,22 +2358,12 @@ Status:
                 # Try reactive exploration while Nav2 initializes
                 self._try_nav2_with_reactive_fallback()
                 return
-        
+
         while self.running and self.exploring:
-            # Periodic observation to see interesting things
+            # Periodic observation — runs in background, does NOT stop navigation
             if time.time() - last_observation >= self.look_interval:
-                # Stop for observation
-                if self.navigating:
-                    self.cancel_navigation()
-                time.sleep(0.5)
-                
-                observation, _ = self.observe()
-                if observation:
-                    self.speak(observation)
                 last_observation = time.time()
-                
-                while self.speaking and self.running:
-                    time.sleep(0.1)
+                threading.Thread(target=self._observe_in_background, daemon=True).start()
             
             # If not currently navigating, find next frontier
             if not self.navigating and self.exploring:
@@ -2315,7 +2402,8 @@ Status:
                         consecutive_failures = 0
                 else:
                     consecutive_failures = 0
-            
+                    self.last_meaningful_movement = time.time()
+
             # Wait a bit before checking again
             time.sleep(0.5)
             
@@ -2344,6 +2432,7 @@ Status:
 
     def _random_exploration_walk(self):
         """Do a smart exploration walk - prioritize detected doorways/gaps!"""
+        self.explore_mode = "random-walk"
         self.get_logger().info("🎲 Smart exploration walk to find new areas...")
         
         # FIRST: Check for detected doorways/gaps - these are the best targets!
@@ -2356,6 +2445,7 @@ Status:
             gap_angle = best_gap['angle']  # Already in degrees from front
             
             if abs(gap_angle) > 10:  # Need to turn
+                twist.linear.x = 0.08  # Ackerman needs forward motion to turn
                 twist.angular.z = 0.3 if gap_angle > 0 else -0.3
                 turn_time = abs(gap_angle) / 30  # Rough turn time estimate
                 turn_time = min(turn_time, 3.0)  # Cap at 3s
@@ -2373,7 +2463,7 @@ Status:
             drive_time = min(best_gap['distance'] / 0.15 + 2.0, 8.0)  # Drive through + extra
             
             self.get_logger().info(f"🚀 Driving through doorway for {drive_time:.1f}s")
-            self.speak("I see an opening, going through!")
+            threading.Thread(target=self.speak, args=("I see an opening, going through!",), daemon=True).start()
             
             for _ in range(int(drive_time * 20)):
                 if not self.exploring or not self.running:
@@ -2410,12 +2500,14 @@ Status:
         
         self.get_logger().info(f"Best direction: {best_direction} ({best_distance:.2f}m clear)")
         
-        # Turn toward best direction
+        # Turn toward best direction (Ackerman needs forward motion to turn)
         twist = Twist()
         if best_direction == "left" or best_direction == "front_left":
+            twist.linear.x = 0.08  # Ackerman minimum forward speed for turning
             twist.angular.z = 0.4
             turn_time = 1.5
         elif best_direction == "right" or best_direction == "front_right":
+            twist.linear.x = 0.08  # Ackerman minimum forward speed for turning
             twist.angular.z = -0.4
             turn_time = 1.5
         else:
@@ -2476,28 +2568,27 @@ Status:
 
     def _reactive_exploration_step(self):
         """Single step of reactive exploration."""
-        front = self.obstacle_distances.get("front", 10)
+        # Use narrow ±30° cone for exploration (not the full 135° combined sector)
         front_wide = self.obstacle_distances.get("front_wide", 10)
-        fl = self.obstacle_distances.get("front_left", 10)
-        fr = self.obstacle_distances.get("front_right", 10)
-        min_front = min(front, front_wide, fl, fr)
-        
+
         twist = Twist()
-        
-        if min_front < self.min_obstacle_dist:
-            # Turn away from obstacle
+
+        if front_wide < self.explore_obstacle_dist:
+            # Forward arc turn — Ackerman needs forward motion to steer
             left = self.obstacle_distances.get("left", 10)
             right = self.obstacle_distances.get("right", 10)
+            twist.linear.x = 0.08
             twist.angular.z = 0.4 if left > right else -0.4
         else:
             # Go forward with slight random variation
             twist.linear.x = 0.1
             twist.angular.z = random.uniform(-0.1, 0.1)
-        
+
         self.cmd_vel_pub.publish(twist)
 
     def _reactive_exploration_loop(self):
         """Fallback reactive exploration (no Nav2) - now with doorway detection!"""
+        self.explore_mode = "reactive"
         last_observation = time.time() - self.look_interval + 5
         stuck_count = 0
         last_gap_attempt = 0
@@ -2505,19 +2596,10 @@ Status:
         self.get_logger().info("🚀 Reactive exploration with doorway detection")
         
         while self.running and self.exploring:
-            # Periodic observation
+            # Periodic observation — runs in background, does NOT stop movement
             if time.time() - last_observation >= self.look_interval:
-                twist = Twist()
-                self.cmd_vel_pub.publish(twist)
-                time.sleep(0.5)
-                
-                observation, _ = self.observe()
-                if observation:
-                    self.speak(observation)
                 last_observation = time.time()
-                
-                while self.speaking and self.running:
-                    time.sleep(0.1)
+                threading.Thread(target=self._observe_in_background, daemon=True).start()
             
             # PRIORITY 1: Check for doorways/gaps and go through them!
             if self.detected_gaps and time.time() - last_gap_attempt > 10:
@@ -2529,48 +2611,43 @@ Status:
                     continue
             
             # Check if we need to turn away from obstacle FIRST
-            front = self.obstacle_distances.get("front", 10)
+            # Use narrow ±30° cone for exploration obstacle detection
             front_wide = self.obstacle_distances.get("front_wide", 10)
-            fl = self.obstacle_distances.get("front_left", 10)
-            fr = self.obstacle_distances.get("front_right", 10)
-            min_front = min(front, front_wide, fl, fr)
-            
-            if min_front < self.min_obstacle_dist:
+            min_front = front_wide
+
+            if min_front < self.explore_obstacle_dist:
                 # Obstacle too close - turn away first!
                 stuck_count += 1
                 self.get_logger().warning(f"🔄 Obstacle at {min_front:.2f}m - turning away (attempt {stuck_count})")
-                
+
                 # Choose turn direction based on which side is clearer
                 left = self.obstacle_distances.get("left", 10)
                 right = self.obstacle_distances.get("right", 10)
-                
-                if stuck_count > 5:
-                    # Really stuck - back up first
-                    self.get_logger().warning("↩️ Stuck! Backing up...")
-                    twist = Twist()
-                    twist.linear.x = -0.1
-                    for _ in range(30):  # 1.5 seconds
-                        self.cmd_vel_pub.publish(twist)
-                        time.sleep(0.05)
+
+                if stuck_count > 3:
+                    # Escalate to smart exploration walk (gap detection + open space)
+                    self.get_logger().info("Stuck — escalating to smart exploration walk")
+                    self._random_exploration_walk()
                     stuck_count = 0
-                
-                # Turn in place toward clearer side
+                    continue
+
+                # Forward arc turn — Ackerman needs forward motion to steer
                 twist = Twist()
-                twist.linear.x = 0.0  # No forward motion
-                if left > right or fl > fr:
+                twist.linear.x = 0.08
+                if left > right:
                     twist.angular.z = self.angular_speed * 1.5  # Turn left
                     self.get_logger().info(f"↰ Turning left (L:{left:.2f}m > R:{right:.2f}m)")
                 else:
                     twist.angular.z = -self.angular_speed * 1.5  # Turn right
                     self.get_logger().info(f"↱ Turning right (R:{right:.2f}m > L:{left:.2f}m)")
-                
+
                 # Turn for a bit
                 for _ in range(20):  # 1 second of turning
                     if not self.exploring or not self.running:
                         break
                     self.cmd_vel_pub.publish(twist)
                     time.sleep(0.05)
-                
+
                 # Stop and re-check
                 twist = Twist()
                 self.cmd_vel_pub.publish(twist)
@@ -2613,6 +2690,8 @@ Status:
 
     def stop_exploration(self):
         self.exploring = False
+        self.explore_mode = "idle"
+        self.explore_frontier_count = 0
         twist = Twist()
         self.cmd_vel_pub.publish(twist)
         self.get_logger().info("Exploration stopped")
@@ -2686,7 +2765,7 @@ Status:
             # Clear old data to detect fresh updates
             self.latest_scan = None
             self.latest_odom = None
-            # Don't clear image as frequently
+            self.latest_image = None
 
     # === Main ===
     
@@ -2741,6 +2820,22 @@ Status:
             self.speak(f"Warning! Missing sensors: {', '.join(missing_sensors)}. Some features may not work.")
         
         self.get_logger().info(f"✅ Available sensors: {', '.join(sensors)}")
+        
+        # Wait briefly for VSLAM odometry (started by start_robot.sh).
+        # VSLAM needs a few seconds after camera is up to publish its first pose.
+        if not self.vslam_tracking:
+            self.get_logger().info("Checking for VSLAM odometry (up to 10s)...")
+            vslam_wait_start = time.time()
+            while (time.time() - vslam_wait_start) < 10:
+                rclpy.spin_once(self, timeout_sec=0.5)
+                if self.vslam_tracking:
+                    break
+        
+        # Detect externally-launched VSLAM (started by start_robot.sh)
+        if self.vslam_tracking and not self.vslam_available:
+            self.vslam_available = True
+            sensors.append("VSLAM")
+            self.get_logger().info("✅ Isaac VSLAM detected (started externally)")
         
         if len(sensors) == 0:
             self.get_logger().error("No sensors detected! Robot cannot operate safely.")
