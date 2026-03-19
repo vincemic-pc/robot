@@ -243,6 +243,9 @@ step_deploy_scripts() {
 
     copy_to_robot "$ROBOT_SCRIPTS_DIR" "${files_to_copy[@]}"
 
+    # Fix Windows CRLF line endings (scp from Windows preserves them)
+    run_on_robot "cd ${ROBOT_SCRIPTS_DIR} && sed -i 's/\r$//' *.sh *.py *.launch.py 2>/dev/null || true"
+
     # Make shell scripts and Python files executable
     run_on_robot "chmod +x ${ROBOT_SCRIPTS_DIR}/*.sh ${ROBOT_SCRIPTS_DIR}/*.py"
 
@@ -267,10 +270,11 @@ step_deploy_services() {
 
     copy_to_robot "$tmp_dir" "${svc_files[@]}"
 
-    # Install to systemd directory and reload
-    run_on_robot "sudo cp ${tmp_dir}/*.service ${tmp_dir}/*.target ${SYSTEMD_DIR}/ && \
+    # Fix CRLF line endings and install to systemd directory
+    run_on_robot "cd ${tmp_dir} && sed -i 's/\r$//' *.service *.target && \
+                  sudo cp *.service *.target ${SYSTEMD_DIR}/ && \
                   sudo systemctl daemon-reload && \
-                  rm -rf $tmp_dir"
+                  rm -rf ${tmp_dir}"
 
     # Enable robot.target so it starts on boot
     run_on_robot "sudo systemctl enable robot.target" 2>/dev/null || true
@@ -303,21 +307,36 @@ step_deploy_interfaces() {
     scp -o ConnectTimeout=10 -o BatchMode=yes -r \
         "$SCRIPT_DIR/robot_interfaces" "$ROBOT_HOST:${ROBOT_WS}/src/robot_interfaces"
 
-    # Build on robot
+    # Build on robot (colcon emits harmless CMake warnings to stderr)
     info "Building robot_interfaces on Jetson (colcon)..."
     run_on_robot "bash -c '
-        source /opt/ros/humble/setup.bash
-        cd ${ROBOT_WS}
-        colcon build --packages-select robot_interfaces --symlink-install 2>&1
+        source /opt/ros/humble/setup.bash &&
+        cd ${ROBOT_WS} &&
+        colcon build --packages-select robot_interfaces
+    '" 2>&1 || {
+        fail "colcon build failed — check output above"
+        exit 1
+    }
+
+    # Some ament_cmake versions omit the ament_prefix_path hook, which
+    # prevents ros2 CLI from finding the package.  Create it if missing.
+    run_on_robot "bash -c '
+        HOOK_DIR=${ROBOT_WS}/install/robot_interfaces/share/robot_interfaces/hook
+        DSV_FILE=\${HOOK_DIR}/ament_prefix_path.dsv
+        PKG_DSV=${ROBOT_WS}/install/robot_interfaces/share/robot_interfaces/package.dsv
+        if [ ! -f \"\$DSV_FILE\" ]; then
+            echo \"prepend-non-duplicate;AMENT_PREFIX_PATH;\" > \"\$DSV_FILE\"
+            echo \"source;share/robot_interfaces/hook/ament_prefix_path.dsv\" >> \"\$PKG_DSV\"
+        fi
     '"
 
     # Verify
     local verify_output
     verify_output=$(run_on_robot "bash -c '
-        source /opt/ros/humble/setup.bash
-        source ${ROBOT_WS}/install/setup.bash
-        ros2 interface show robot_interfaces/msg/VelocityRequest 2>&1
-    '")
+        source /opt/ros/humble/setup.bash &&
+        export AMENT_PREFIX_PATH=${ROBOT_WS}/install/robot_interfaces:\$AMENT_PREFIX_PATH &&
+        ros2 interface show robot_interfaces/msg/VelocityRequest
+    '" 2>&1) || true
 
     if echo "$verify_output" | grep -q "twist"; then
         success "robot_interfaces built and verified"
@@ -340,10 +359,14 @@ step_install_deps() {
         return 0
     fi
 
-    # Check which packages are missing
+    # Check which packages are missing (import name may differ from pip name)
+    declare -A PIP_IMPORT_MAP=(
+        [pyyaml]=yaml
+    )
     local missing_pkgs=()
     for pkg in "${PIP_PACKAGES[@]}"; do
-        if ! run_on_robot "python3 -c 'import ${pkg}' 2>/dev/null"; then
+        local import_name="${PIP_IMPORT_MAP[$pkg]:-$pkg}"
+        if ! run_on_robot "python3 -c 'import ${import_name}' 2>/dev/null"; then
             missing_pkgs+=("$pkg")
         fi
     done
