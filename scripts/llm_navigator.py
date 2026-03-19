@@ -198,10 +198,18 @@ EXPLORATION STRATEGY:
 SAFETY CONSTRAINTS (non-negotiable):
 - Maximum speed: 0.18 m/s. Use slow (0.08) near obstacles, medium (0.12) normally.
 - A safety layer monitors LiDAR at 10 Hz and WILL override your commands if too close.
-- If your action was safety-overridden, do NOT retry the same direction. Choose another path.
+- If your action was safety-overridden or FAILED, do NOT retry the same direction or action.
+  Try a DIFFERENT approach: move_toward backward, rotate the opposite way, or pick another direction.
 - Never push through narrow gaps (<0.5m width) -- the robot is 0.25m wide.
 - Ackerman steering: the robot cannot spin in place. All turns require forward motion.
 - If uncertain, call stop_robot or check_path_clear before moving.
+
+STUCK RECOVERY (critical):
+- If PREVIOUS ACTION RESULT shows FAILED, you MUST choose a different action.
+- If forward is blocked, use move_toward with direction "backward" to back up first.
+- After backing up, rotate to face a clear direction, then proceed.
+- Check the AFFORDANCES line: directions with higher scores have more clearance.
+- If multiple directions are blocked, back up first, then rotate toward the highest-affordance direction.
 
 REASONING (required):
 Before each action, briefly state:

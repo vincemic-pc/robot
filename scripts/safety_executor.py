@@ -86,9 +86,11 @@ DIRECTION_TO_LIDAR = {
 ACKERMAN_MIN_LINEAR = 0.05   # m/s minimum forward when turning
 ACKERMAN_ANGULAR_SPEED = 0.4  # rad/s for arc turns
 REJECT_DISTANCE = 0.5        # reject move if clearance < this (matches min_obstacle_dist)
+ROTATE_REJECT_DISTANCE = 0.3 # rotate only creeps forward at 0.05 m/s; needs less room
 DOWNGRADE_DISTANCE = 1.0     # downgrade to "slow" if clearance < this (matches slow_dist)
 BLOCKED_COOLDOWN_S = 15.0
 BLOCKED_MAX_RETRIES = 2
+STUCK_ESCAPE_THRESHOLD = 2   # blocked movement actions before auto-escape (triggers on the 3rd attempt)
 
 
 # -- BlockedActionMemory (Task 3.1) -----------------------------------------
@@ -235,6 +237,32 @@ class SafetyExecutor:
         self.blocked_memory = BlockedActionMemory()
         self.watchdog = LLMWatchdog()
         self.network_monitor = NetworkMonitor()
+        self._consecutive_blocked = 0  # tracks consecutive blocked/rejected actions
+
+    # -- Stuck escape --
+
+    def _maybe_escape(self, obstacle_distances):
+        """If enough consecutive movement blocks have accumulated, return a
+        backward escape maneuver.  Returns ExecutionResult or None."""
+        if self._consecutive_blocked < STUCK_ESCAPE_THRESHOLD:
+            return None
+        back_dist = obstacle_distances.get("back", 10.0)
+        if back_dist < ROTATE_REJECT_DISTANCE:
+            logger.warning("Stuck but can't escape — back blocked at %.2fm", back_dist)
+            self._consecutive_blocked = 0  # reset to avoid infinite loop
+            return None
+        self._consecutive_blocked = 0
+        self.blocked_memory.clear()
+        logger.warning(
+            "STUCK ESCAPE: %d consecutive blocks — backing up (%.1fm clear behind)",
+            STUCK_ESCAPE_THRESHOLD, back_dist)
+        twist = Twist()
+        twist.linear.x = -0.08
+        return ExecutionResult(
+            success=True,
+            target=VelocityTarget(twist=twist, duration_s=2.0),
+            safety_override=True,
+            safety_message=f"Auto-escape: backed up to clear obstacle")
 
     # -- Pre-validation (Task 3.4) --
 
@@ -276,13 +304,16 @@ class SafetyExecutor:
                     f"Speed downgraded to 'slow': obstacle at {min_clearance:.2f}m")
 
         elif tool == "rotate":
+            # Rotations only creep forward at ACKERMAN_MIN_LINEAR (0.05 m/s),
+            # so they need much less clearance than a full move.  Only block
+            # if both the front AND the turn-side are dangerously close.
             front_dist = min(obstacle_distances.get("front", 10.0),
                              obstacle_distances.get("front_wide", 10.0))
-            if front_dist < REJECT_DISTANCE:
+            if front_dist < ROTATE_REJECT_DISTANCE:
                 degrees = params.get("degrees", 0)
                 side = "front_left" if degrees < 0 else "front_right"
                 side_dist = obstacle_distances.get(side, 10.0)
-                if side_dist < REJECT_DISTANCE:
+                if side_dist < ROTATE_REJECT_DISTANCE:
                     return False, decision, (
                         f"Rotation blocked: front {front_dist:.2f}m, "
                         f"{side} {side_dist:.2f}m")
@@ -408,18 +439,27 @@ class SafetyExecutor:
         # Blocked-action check
         allowed, warning = self.blocked_memory.should_allow(decision)
         if not allowed:
+            if tool in ("move_toward", "rotate"):
+                self._consecutive_blocked += 1
             logger.warning("Blocked by memory: %s", warning)
-            return ExecutionResult(success=False, target=StopTarget(reason="blocked_action"),
-                                   safety_override=True, safety_message=warning)
+            return self._maybe_escape(obstacle_distances) or ExecutionResult(
+                success=False, target=StopTarget(reason="blocked_action"),
+                safety_override=True, safety_message=warning)
 
         # Pre-validation (LiDAR clearance)
         valid, decision, reason = self._pre_validate(decision, obstacle_distances)
         if not valid:
+            if tool in ("move_toward", "rotate"):
+                self._consecutive_blocked += 1
             self.blocked_memory.record_blocked(decision)
             logger.warning("Pre-validation rejected: %s", reason)
-            return ExecutionResult(success=False, target=StopTarget(reason="safety_rejected"),
-                                   safety_override=True, safety_message=reason)
+            return self._maybe_escape(obstacle_distances) or ExecutionResult(
+                success=False, target=StopTarget(reason="safety_rejected"),
+                safety_override=True, safety_message=reason)
 
+        # Successful movement action — reset stuck counter
+        if tool in ("move_toward", "rotate"):
+            self._consecutive_blocked = 0
         so = bool(reason)  # safety_override
         params = decision.parameters
 

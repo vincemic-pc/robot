@@ -2412,17 +2412,6 @@ Status:
             if self.llm_nav_paused.is_set():
                 continue
 
-            # --- Camera freshness guard ---
-            # If camera data is stale, skip this VLM cycle (the sensor monitor
-            # will pause exploration if the outage persists).  This prevents
-            # sending blank frames to the VLM and wasting API calls.
-            if (self.latest_image_time is not None
-                    and (time.time() - self.latest_image_time) > 5.0):
-                self.get_logger().debug(
-                    f"VLM cycle skipped — camera stale ({time.time() - self.latest_image_time:.1f}s)")
-                time.sleep(1.0)
-                continue
-
             try:
                 # Capture sensor snapshot
                 snapshot = self.snapshot_builder.capture()
