@@ -1936,8 +1936,8 @@ If the object is not visible, set found to false. Only respond with valid JSON."
 
         # Reject stale images — camera may have disconnected
         if self.latest_image_time and (time.time() - self.latest_image_time) > 5.0:
-            self.get_logger().warning("Rejecting stale image (%.1fs old)",
-                                     time.time() - self.latest_image_time)
+            self.get_logger().warning(
+                f"Rejecting stale image ({time.time() - self.latest_image_time:.1f}s old)")
             return "Camera not available — image is stale.", None
         
         image_b64, cv_image = self.image_to_base64(self.latest_image)
@@ -2398,7 +2398,7 @@ Status:
                 if trigger_reasons:
                     triggered = True
                     self.get_logger().info(
-                        "VLM trigger fired: %s", ", ".join(trigger_reasons))
+                        f"VLM trigger fired: {', '.join(trigger_reasons)}")
                     break
                 # External wake (e.g. from control loop on stuck detection)
                 if self._vlm_trigger_event.wait(timeout=trigger_poll_s):
@@ -2419,8 +2419,7 @@ Status:
             if (self.latest_image_time is not None
                     and (time.time() - self.latest_image_time) > 5.0):
                 self.get_logger().debug(
-                    "VLM cycle skipped — camera stale (%.1fs)",
-                    time.time() - self.latest_image_time)
+                    f"VLM cycle skipped — camera stale ({time.time() - self.latest_image_time:.1f}s)")
                 time.sleep(1.0)
                 continue
 
@@ -2454,8 +2453,7 @@ Status:
                     if similarity > 0.92 and nearest_obstacle > 2.0:
                         self._vlm_skipped_calls += 1
                         self.get_logger().debug(
-                            "Skipping VLM: similarity=%.3f, nearest=%.1fm",
-                            similarity, nearest_obstacle)
+                            f"Skipping VLM: similarity={similarity:.3f}, nearest={nearest_obstacle:.1f}m")
                         skip_call = True
 
                 if skip_call:
@@ -2491,8 +2489,7 @@ Status:
                     if corr_similarity > 0.95 and nearest > 3.0:
                         skip_image = True
                         self.get_logger().debug(
-                            "Text-only VLM call: similarity=%.3f, nearest=%.1fm",
-                            corr_similarity, nearest)
+                            f"Text-only VLM call: similarity={corr_similarity:.3f}, nearest={nearest:.1f}m")
 
                 # Call VLM
                 t0 = time.time()
@@ -2556,10 +2553,8 @@ Status:
         tier = self.safety_executor.network_monitor.current_tier
 
         self.get_logger().info(
-            "VLM stats: %d calls/min (%d triggered, %d skipped), "
-            "avg latency %.0fms, tier %d",
-            calls_per_min, triggered_per_min, skipped_per_min,
-            avg_latency, tier)
+            f"VLM stats: {calls_per_min} calls/min ({triggered_per_min} triggered, {skipped_per_min} skipped), "
+            f"avg latency {avg_latency:.0f}ms, tier {tier}")
 
         # Reset counters for next interval
         self._vlm_calls = 0
@@ -3241,7 +3236,7 @@ Status:
                 image_warned = False
             elif now - last_image_time > CAMERA_LOSS_TIMEOUT and not camera_lost:
                 camera_lost = True
-                self.get_logger().error("Camera data lost! No frames for %.0fs", CAMERA_LOSS_TIMEOUT)
+                self.get_logger().error(f"Camera data lost! No frames for {CAMERA_LOSS_TIMEOUT:.0f}s")
                 self.beep("error")
                 if self.llm_exploring:
                     self.get_logger().warning("Pausing exploration — camera unavailable")
@@ -3256,8 +3251,7 @@ Status:
                     if self.vslam_tracking:
                         self.vslam_tracking = False
                         self.get_logger().warning(
-                            "VSLAM odometry stale (no data for %.0fs) — marking unavailable",
-                            now - self.vslam_last_odom_time)
+                            f"VSLAM odometry stale (no data for {now - self.vslam_last_odom_time:.0f}s) — marking unavailable")
                     if not vslam_warned:
                         vslam_warned = True
                         self.get_logger().warning("VSLAM lost — falling back to wheel odometry")
@@ -3303,10 +3297,21 @@ Status:
                 break
             if self.latest_scan:
                 self.get_logger().info(f"  LiDAR ready, waiting for odom/camera... ({int(30 - (time.time() - start_wait))}s)")
-        
+
+        # After core sensors arrive, give camera a few more seconds (it often
+        # finishes its pipeline 1-2s after LiDAR/odom are already publishing).
+        if self.latest_scan and self.latest_odom and not self.latest_image:
+            self.get_logger().info("Core sensors ready, waiting up to 10s for camera...")
+            cam_wait_start = time.time()
+            while (time.time() - cam_wait_start) < 10:
+                rclpy.spin_once(self, timeout_sec=0.5)
+                if self.latest_image:
+                    self.get_logger().info("Camera ready!")
+                    break
+
         sensors = []
         missing_sensors = []
-        
+
         if self.latest_image:
             sensors.append("camera")
         else:
