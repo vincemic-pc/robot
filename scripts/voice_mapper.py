@@ -369,7 +369,7 @@ class VoiceMapper(Node):
         
         # Exploration settings
         self.look_interval = 15.0
-        self.explore_obstacle_dist = 0.3  # Exploration obstacle threshold (matches emergency_dist)
+        self.explore_obstacle_dist = 0.6  # Exploration obstacle threshold (must exceed arbiter safety.min_distance=0.5)
         self.explore_mode = "idle"            # "idle" | "nav2-frontier" | "reactive" | "random-walk"
         self.last_meaningful_movement = 0.0   # timestamp of last position change > 0.3m
         self.explore_frontier_count = 0       # frontiers found in last check
@@ -3045,8 +3045,12 @@ Status:
                     continue
 
             # Check if we need to turn away from obstacle
+            # Must match arbiter's safety filter which checks min of all front sectors
             front_wide = self.obstacle_distances.get("front_wide", 10)
-            min_front = front_wide
+            front = self.obstacle_distances.get("front", 10)
+            fl = self.obstacle_distances.get("front_left", 10)
+            fr = self.obstacle_distances.get("front_right", 10)
+            min_front = min(front_wide, front, fl, fr)
 
             if min_front < self.explore_obstacle_dist:
                 stuck_count += 1
@@ -3286,15 +3290,26 @@ Status:
         
         # Startup success!
         self.beep("success")
-        self.speak(f"Mapper ready with {len(sensors)} sensors. Say 'start mapping' to begin!")
-        
+
         # Start sensor monitoring thread
         self.sensor_monitor_thread = threading.Thread(target=self._sensor_monitor_loop, daemon=True)
         self.sensor_monitor_thread.start()
-        
+
         # Voice thread
         voice_thread = threading.Thread(target=self.voice_loop, daemon=True)
         voice_thread.start()
+
+        # Auto-start exploration if all core sensors are present
+        core_ok = "camera" in sensors and "LiDAR" in sensors
+        if core_ok:
+            self.speak(f"All {len(sensors)} sensors ready. Starting exploration automatically.")
+            time.sleep(1)
+            if not self.mapping:
+                self.start_slam()
+                time.sleep(2)
+            self.start_exploration()
+        else:
+            self.speak(f"Mapper ready with {len(sensors)} sensors. Say 'start exploring' to begin!")
         
         # ROS spin
         while self.running and rclpy.ok():
