@@ -302,12 +302,17 @@ class SafetyFilter:
 
         Returns (filtered_twist, SafetyState).
         Ported from _compute_safe_velocity() lines 2062-2099.
+
+        IMPORTANT: The original _compute_safe_velocity() only scaled linear.x
+        and never touched angular.z. This filter preserves that behavior —
+        angular velocity is always passed through so the robot can rotate
+        away from obstacles. Only linear velocity is restricted.
         """
         state = SafetyState()
         linear = twist.linear.x
         angular = twist.angular.z
 
-        # If scan data is stale, safety stop
+        # If scan data is stale, full safety stop (including angular)
         if not self.scan_fresh():
             state.emergency = True
             state.reason = "scan_stale"
@@ -323,28 +328,33 @@ class SafetyFilter:
         state.front_distance = min_front
         state.back_distance = back_dist
 
+        result = Twist()
+        result.angular.z = angular  # Angular always preserved (match original)
+
         # Emergency stop: obstacle in narrow front arc < emergency_distance
+        # Block linear only — allow rotation so robot can turn away
         if min_front < self.emergency_distance:
             state.emergency = True
             state.reason = f"emergency_front_{min_front:.2f}m"
-            return self._zero_twist(), state
+            result.linear.x = 0.0
+            return result, state
 
         # Forward obstacle check: stop forward motion if < min_distance
         if linear > 0 and min_front < self.min_distance:
             state.stopped = True
             state.reason = f"obstacle_front_{min_front:.2f}m"
-            return self._zero_twist(), state
+            result.linear.x = 0.0
+            return result, state
 
         # Rear obstacle check: block reverse if back < min_distance
         if linear < 0 and back_dist < self.min_distance:
             state.stopped = True
             state.reason = f"obstacle_back_{back_dist:.2f}m"
-            return self._zero_twist(), state
+            result.linear.x = 0.0
+            return result, state
 
         # Proportional slowdown for forward motion
-        result = Twist()
         result.linear.x = linear
-        result.angular.z = angular
 
         if linear > 0 and min_front < self.slow_distance:
             denom = self.slow_distance - self.min_distance
@@ -435,16 +445,22 @@ class VelocityArbiter(Node):
         super().__init__('velocity_arbiter')
 
         # -- Declare ROS2 parameters with defaults --
+        # Tuned on live robot 2026-03-19 (Phase 4 validation)
         self.declare_parameter('control_rate_hz', 50.0)
         self.declare_parameter('safety.emergency_distance', 0.3)
         self.declare_parameter('safety.min_distance', 0.5)
         self.declare_parameter('safety.slow_distance', 1.0)
         self.declare_parameter('safety.min_speed_factor', 0.3)
         self.declare_parameter('safety.scan_timeout_s', 1.0)
-        self.declare_parameter('heading_pid.kp', 1.0)
+        # Heading PID: hardware-limited to ~7 deg/s turn rate.
+        # High Kp+max_angular ensures PID isn't the bottleneck.
+        self.declare_parameter('heading_pid.kp', 2.0)
         self.declare_parameter('heading_pid.ki', 0.0)
-        self.declare_parameter('heading_pid.kd', 0.2)
-        self.declare_parameter('heading_pid.max_angular', 0.5)
+        self.declare_parameter('heading_pid.kd', 0.1)
+        self.declare_parameter('heading_pid.max_angular', 1.5)
+        # Velocity PID: STM32 firmware undershoots (~20% of target without PID).
+        # ROS2 PID brings accuracy to ~82% at 0.10 m/s. Two PIDs in series
+        # (STM32 + ROS2) — keep gains moderate to avoid oscillation.
         self.declare_parameter('velocity_pid.kp', 2.0)
         self.declare_parameter('velocity_pid.ki', 0.5)
         self.declare_parameter('velocity_pid.kd', 0.1)
@@ -452,6 +468,8 @@ class VelocityArbiter(Node):
         self.declare_parameter('velocity_pid.feedback_timeout_s', 0.5)
         self.declare_parameter('velocity_pid.max_correction', 0.1)
         self.declare_parameter('arbitration.request_timeout_s', 0.5)
+        # Hardware requires minimum linear velocity for angular to engage.
+        # ROSMASTER STM32 driver ignores angular when linear.x == 0.
         self.declare_parameter('ackerman.min_linear_for_turn', 0.05)
 
         # -- Read parameters --
@@ -656,11 +674,15 @@ class VelocityArbiter(Node):
             self._last_vel_error_angular = 0.0
 
         # 4. Safety filter LAST — non-bypassable final gate
+        #    Safety filter zeros linear but preserves angular (matching original
+        #    _compute_safe_velocity() behavior — robot can always rotate away).
+        #    Exception: stale scan → full stop including angular.
         twist, safety = self.safety_filter.apply(twist)
         self._last_safety_state = safety
 
         if safety.emergency or safety.stopped:
-            self._publish_zero()
+            # Publish the safety-filtered twist (linear=0, angular preserved)
+            self.cmd_vel_pub.publish(twist)
             return
 
         # 5. Ackerman constraint
