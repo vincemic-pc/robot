@@ -84,14 +84,14 @@ TOOL_DEFINITIONS = [
                                  "coordinates: go to (x,y). retrace: return to start.",
               },
               "frontier_id": {
-                  "type": "integer",
-                  "description": "Frontier ID (when goal_type=frontier)",
+                  "type": ["integer", "null"],
+                  "description": "Frontier ID (when goal_type=frontier, else null)",
               },
-              "x": {"type": "number", "description": "Map x in metres (when coordinates)"},
-              "y": {"type": "number", "description": "Map y in metres (when coordinates)"},
+              "x": {"type": ["number", "null"], "description": "Map x in metres (when coordinates, else null)"},
+              "y": {"type": ["number", "null"], "description": "Map y in metres (when coordinates, else null)"},
               "reason": {"type": "string", "description": "Why this goal"},
           },
-          ["goal_type", "reason"]),
+          ["goal_type", "frontier_id", "x", "y", "reason"]),
 
     _tool("rotate",
           "Turn the robot (Ackerman-adapted arc turn with minimal forward motion). "
