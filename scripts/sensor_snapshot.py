@@ -261,12 +261,13 @@ def compute_frame_similarity(frame_a, frame_b):
 # Event Trigger (Phase 5, Task 5.1)
 # ---------------------------------------------------------------------------
 
-# Trigger thresholds
-DOORWAY_MIN_WIDTH_M = 0.7      # Gap must be >= 0.7m wide to count as doorway
+# Trigger thresholds — tuned for progress: robot moves ~0.12 m/s, so triggers
+# must allow enough travel distance between VLM calls to make real progress.
+DOORWAY_MIN_WIDTH_M = 1.2      # Gap must be >= 1.2m wide (0.7 triggered in hallways)
 T_INTERSECTION_OPEN_SECTORS = 3 # Need 3+ adjacent open sectors for intersection
-DEAD_END_FORWARD_MAX_M = 1.0   # All forward sectors < 1.0m = dead end
-POSITION_TRIGGER_M = 1.5       # Trigger if moved > 1.5m since last VLM call
-TRIGGER_COOLDOWN_S = 2.0       # No re-trigger within 2 seconds
+DEAD_END_FORWARD_MAX_M = 0.6   # All forward sectors < 0.6m = dead end (was 1.0)
+POSITION_TRIGGER_M = 3.0       # Trigger if moved > 3.0m since last VLM call (was 1.5)
+TRIGGER_COOLDOWN_S = 5.0       # No re-trigger within 5 seconds (was 2.0)
 
 
 class EventTrigger:

@@ -362,9 +362,9 @@ class VoiceMapper(Node):
         self.min_obstacle_dist = 0.5  # Emergency stop distance (was 0.4)
         self.slow_dist = 1.0  # Start slowing down (was 0.8)
         self.emergency_dist = 0.3  # Absolute minimum - reverse if closer
-        self.linear_speed = 0.12  # Max forward speed (was 0.15)
+        self.linear_speed = 0.15  # Max forward speed
         self.slow_speed = 0.06  # Speed near obstacles (was 0.08)
-        self.angular_speed = 0.3  # Lower for Ackerman
+        self.angular_speed = 0.4  # Turn speed
         self.min_turn_radius = 0.3  # Ackerman constraint
         
         # Exploration settings
@@ -2360,8 +2360,8 @@ Status:
         EventTrigger checks at 10 Hz for doorway/intersection/dead-end/movement
         events. Falls back to 5s base interval if no triggers fire.
         """
-        base_interval = 5.0       # seconds — base rate fallback
-        safety_backstop = 10.0    # never skip if > 10s since last VLM call
+        base_interval = 15.0      # seconds — base rate fallback (was 5.0)
+        safety_backstop = 30.0    # never skip if > 30s since last VLM call
         trigger_poll_hz = 10      # Hz to poll EventTrigger
         trigger_poll_s = 1.0 / trigger_poll_hz
         last_call_time = 0.0
@@ -2963,10 +2963,10 @@ Status:
             time.sleep(turn_time)
 
         # Drive forward
-        drive_time = min(best_distance / 0.12, 5.0)
+        drive_time = min(best_distance / self.linear_speed, 5.0)
         self.get_logger().info(f"Driving forward for {drive_time:.1f}s")
         self._publish_velocity_request(
-            0.12, 0, VelocityRequest.PRIORITY_EXPLORATION,
+            self.linear_speed, 0, VelocityRequest.PRIORITY_EXPLORATION,
             "walk_drive", duration_s=drive_time)
         time.sleep(drive_time)
 
