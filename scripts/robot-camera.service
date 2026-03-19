@@ -1,7 +1,7 @@
 [Unit]
 Description=Robot Camera (OAK-D Pro)
-StartLimitBurst=5
-StartLimitIntervalSec=120
+StartLimitBurst=10
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple

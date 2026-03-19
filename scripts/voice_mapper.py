@@ -260,6 +260,7 @@ class VoiceMapper(Node):
         self.vslam_tracking = False
         self.vslam_pose = None
         self.vslam_path = []  # Visual odometry path
+        self.vslam_last_odom_time = 0.0  # Timestamp of last VSLAM odometry msg
         
         # VSLAM services (will be created when VSLAM starts)
         self.vslam_save_map_client = None
@@ -1014,6 +1015,7 @@ Always respond with valid JSON. Keep speech short (1-2 sentences)."""
         """Isaac VSLAM odometry callback - high-frequency visual odometry"""
         self.vslam_pose = msg.pose.pose
         self.vslam_tracking = True
+        self.vslam_last_odom_time = time.time()
         
         # Update current position from VSLAM if in VSLAM or hybrid mode
         if self.slam_mode in [SlamMode.VSLAM, SlamMode.HYBRID]:
@@ -2410,6 +2412,18 @@ Status:
             if self.llm_nav_paused.is_set():
                 continue
 
+            # --- Camera freshness guard ---
+            # If camera data is stale, skip this VLM cycle (the sensor monitor
+            # will pause exploration if the outage persists).  This prevents
+            # sending blank frames to the VLM and wasting API calls.
+            if (self.latest_image_time is not None
+                    and (time.time() - self.latest_image_time) > 5.0):
+                self.get_logger().debug(
+                    "VLM cycle skipped — camera stale (%.1fs)",
+                    time.time() - self.latest_image_time)
+                time.sleep(1.0)
+                continue
+
             try:
                 # Capture sensor snapshot
                 snapshot = self.snapshot_builder.capture()
@@ -3164,48 +3178,100 @@ Status:
     # === Sensor Monitoring ===
     
     def _sensor_monitor_loop(self):
-        """Monitor sensors and alert on failures."""
+        """Monitor sensors and alert on failures, with recovery handling.
+
+        Camera/VSLAM recovery logic:
+        - Camera lost while exploring → pause exploration, wait for recovery
+        - Camera recovered → resume exploration automatically
+        - VSLAM stale (no odom for 5s) → mark unavailable, warn
+        - VSLAM recovered (odom resumes) → mark available, log recovery
+        """
         last_scan_time = time.time()
         last_odom_time = time.time()
         last_image_time = time.time()
-        
+
         scan_warned = False
         odom_warned = False
         image_warned = False
-        
+        camera_lost = False          # True while camera is down
+        vslam_warned = False
+        exploration_paused_for_camera = False  # True if we paused exploration due to camera loss
+
+        CAMERA_LOSS_TIMEOUT = 5.0    # seconds before declaring camera lost
+        VSLAM_STALE_TIMEOUT = 5.0    # seconds before declaring VSLAM stale
+
         while self.running:
             time.sleep(2)  # Check every 2 seconds
-            
+
             now = time.time()
-            
-            # Check LiDAR (critical for safety)
+
+            # --- LiDAR (critical for safety) ---
             if self.latest_scan:
                 last_scan_time = now
                 scan_warned = False
             elif now - last_scan_time > 5 and not scan_warned:
-                self.get_logger().error("⚠️ LiDAR data lost!")
+                self.get_logger().error("LiDAR data lost!")
                 self.beep("error")
                 if self.exploring:
                     self.speak("Warning! LiDAR sensor lost. Stopping for safety.")
                     self.stop_exploration()
+                    exploration_paused_for_camera = False  # camera pause irrelevant now
                 scan_warned = True
-            
-            # Check odometry
+
+            # --- Odometry ---
             if self.latest_odom:
                 last_odom_time = now
                 odom_warned = False
             elif now - last_odom_time > 5 and not odom_warned:
-                self.get_logger().warning("⚠️ Odometry data lost")
+                self.get_logger().warning("Odometry data lost")
                 odom_warned = True
-            
-            # Check camera (less critical)
+
+            # --- Camera (important for LLM exploration) ---
             if self.latest_image:
                 last_image_time = now
+                if camera_lost:
+                    # Camera recovered!
+                    camera_lost = False
+                    self.get_logger().info("Camera recovered — data flowing again")
+                    if exploration_paused_for_camera:
+                        exploration_paused_for_camera = False
+                        self.get_logger().info("Resuming exploration after camera recovery")
+                        self.beep("success")
+                        self.start_exploration()
                 image_warned = False
-            elif now - last_image_time > 10 and not image_warned:
-                self.get_logger().warning("⚠️ Camera data lost")
+            elif now - last_image_time > CAMERA_LOSS_TIMEOUT and not camera_lost:
+                camera_lost = True
+                self.get_logger().error("Camera data lost! No frames for %.0fs", CAMERA_LOSS_TIMEOUT)
+                self.beep("error")
+                if self.llm_exploring:
+                    self.get_logger().warning("Pausing exploration — camera unavailable")
+                    self.speak("Camera lost. Pausing exploration until camera recovers.")
+                    self.stop_exploration()
+                    exploration_paused_for_camera = True
                 image_warned = True
-            
+
+            # --- VSLAM staleness detection ---
+            if self.vslam_available:
+                if self.vslam_last_odom_time > 0 and (now - self.vslam_last_odom_time) > VSLAM_STALE_TIMEOUT:
+                    if self.vslam_tracking:
+                        self.vslam_tracking = False
+                        self.get_logger().warning(
+                            "VSLAM odometry stale (no data for %.0fs) — marking unavailable",
+                            now - self.vslam_last_odom_time)
+                    if not vslam_warned:
+                        vslam_warned = True
+                        self.get_logger().warning("VSLAM lost — falling back to wheel odometry")
+                elif self.vslam_tracking:
+                    if vslam_warned:
+                        vslam_warned = False
+                        self.get_logger().info("VSLAM recovered — visual odometry restored")
+
+            # --- Detect external VSLAM appearing mid-session ---
+            if not self.vslam_available and self.vslam_tracking and self.vslam_last_odom_time > 0:
+                if (now - self.vslam_last_odom_time) < 2.0:
+                    self.vslam_available = True
+                    self.get_logger().info("VSLAM detected mid-session — visual odometry available")
+
             # Clear old data to detect fresh updates
             self.latest_scan = None
             self.latest_odom = None
