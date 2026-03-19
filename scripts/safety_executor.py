@@ -18,6 +18,7 @@ from typing import Optional
 from geometry_msgs.msg import Twist
 
 from llm_navigator import NavigationDecision
+from sensor_snapshot import compute_affordance_scores
 
 logger = logging.getLogger(__name__)
 
@@ -154,27 +155,141 @@ class LLMWatchdog:
     CONTINUE (0-3s), STOP_WAIT (3-10s), LOCAL_NAV (10-30s), RETURN_HOME (>30s).
     """
 
-    def __init__(self, continue_s=3.0, stop_s=10.0, local_nav_s=30.0):
+    def __init__(self, continue_s=3.0, stop_s=10.0, local_nav_s=30.0,
+                 success_timeout_s=30.0):
         self._continue_s = continue_s
         self._stop_s = stop_s
         self._local_nav_s = local_nav_s
         self._last_response_time = time.time()
+        self._last_success_time = time.time()
+        self._success_timeout_s = success_timeout_s
 
     def feed(self):
         """Record that a VLM response was received (resets timer)."""
         self._last_response_time = time.time()
 
+    def feed_success(self):
+        """Record successful execution (movement actually happened)."""
+        self._last_success_time = time.time()
+
     def evaluate(self, elapsed_s=None):
-        """Return current watchdog tier string. elapsed_s overrides for testing."""
+        """Return current watchdog tier string.
+
+        Returns worst tier across response feed and success feed.
+        elapsed_s overrides response elapsed time for testing.
+        """
         if elapsed_s is None:
             elapsed_s = time.time() - self._last_response_time
+
+        # Response-based tier (existing logic)
         if elapsed_s <= self._continue_s:
-            return "CONTINUE"
-        if elapsed_s <= self._stop_s:
-            return "STOP_WAIT"
-        if elapsed_s <= self._local_nav_s:
-            return "LOCAL_NAV"
-        return "RETURN_HOME"
+            response_tier = "CONTINUE"
+        elif elapsed_s <= self._stop_s:
+            response_tier = "STOP_WAIT"
+        elif elapsed_s <= self._local_nav_s:
+            response_tier = "LOCAL_NAV"
+        else:
+            response_tier = "RETURN_HOME"
+
+        # Success-based tier: escalate to STOP_WAIT if no successful
+        # execution in success_timeout_s, even if VLM is responding
+        success_elapsed = time.time() - self._last_success_time
+        if success_elapsed > self._success_timeout_s:
+            if response_tier == "CONTINUE":
+                return "STOP_WAIT"
+
+        return response_tier
+
+
+# -- StuckDetector (Plan 008, Task 1.1) -------------------------------------
+
+class StuckDetector:
+    """Position-based stuck detection with three-tier escalation.
+
+    Samples odometry position at 1 Hz, maintains a rolling window,
+    and reports stuck state when displacement < threshold.
+    """
+
+    TIER1_TIMEOUT_S = 8.0      # Rotate escape
+    TIER2_TIMEOUT_S = 15.0     # Smart escape (try all directions)
+    TIER3_TIMEOUT_S = 30.0     # Help request
+    STUCK_DISPLACEMENT_M = 0.05  # 5cm — effectively stationary
+    SAMPLE_INTERVAL_S = 1.0    # Position sample rate
+
+    def __init__(self):
+        self._positions = deque(maxlen=30)  # 30 samples at 1 Hz = 30s window
+        self._suspended = False
+        self._last_sample_time = 0.0
+        self._stuck_since = None  # timestamp when stuck started, or None
+
+    def update(self, x, y, now=None):
+        """Sample position, return stuck tier or None.
+
+        Returns: None, "TIER1", "TIER2", "TIER3"
+        Called from control loop. Rate-limited internally to 1 Hz.
+        """
+        if self._suspended:
+            return None
+        if now is None:
+            now = time.time()
+        # Rate-limit to 1 Hz
+        if now - self._last_sample_time < self.SAMPLE_INTERVAL_S:
+            return self.stuck_state
+        self._last_sample_time = now
+        self._positions.append((now, x, y))
+
+        if len(self._positions) < 2:
+            return None
+
+        # Displacement between oldest and newest sample
+        _, x0, y0 = self._positions[0]
+        _, x1, y1 = self._positions[-1]
+        displacement = math.hypot(x1 - x0, y1 - y0)
+
+        if displacement >= self.STUCK_DISPLACEMENT_M:
+            self._stuck_since = None
+            return None
+
+        # Robot is stationary
+        if self._stuck_since is None:
+            self._stuck_since = now
+        elapsed = now - self._stuck_since
+
+        if elapsed >= self.TIER3_TIMEOUT_S:
+            return "TIER3"
+        if elapsed >= self.TIER2_TIMEOUT_S:
+            return "TIER2"
+        if elapsed >= self.TIER1_TIMEOUT_S:
+            return "TIER1"
+        return None
+
+    def suspend(self):
+        """Pause stuck detection (Nav2 goal active, observe in progress)."""
+        self._suspended = True
+
+    def resume(self):
+        """Resume stuck detection."""
+        self._suspended = False
+
+    def reset(self):
+        """Clear position history and stuck state (e.g., after successful escape)."""
+        self._positions.clear()
+        self._stuck_since = None
+        self._last_sample_time = 0.0
+
+    @property
+    def stuck_state(self):
+        """Current stuck tier or None (without sampling — reads cached state)."""
+        if self._suspended or self._stuck_since is None:
+            return None
+        elapsed = time.time() - self._stuck_since
+        if elapsed >= self.TIER3_TIMEOUT_S:
+            return "TIER3"
+        if elapsed >= self.TIER2_TIMEOUT_S:
+            return "TIER2"
+        if elapsed >= self.TIER1_TIMEOUT_S:
+            return "TIER1"
+        return None
 
 
 # -- NetworkMonitor (Task 3.3) ----------------------------------------------
@@ -239,30 +354,103 @@ class SafetyExecutor:
         self.network_monitor = NetworkMonitor()
         self._consecutive_blocked = 0  # tracks consecutive blocked/rejected actions
 
-    # -- Stuck escape --
+    # -- Stuck escape (Plan 008: multi-strategy) --
 
     def _maybe_escape(self, obstacle_distances):
-        """If enough consecutive movement blocks have accumulated, return a
-        backward escape maneuver.  Returns ExecutionResult or None."""
+        """If enough consecutive movement blocks have accumulated, try
+        affordance-ranked multi-strategy escape.  Returns ExecutionResult or None."""
         if self._consecutive_blocked < STUCK_ESCAPE_THRESHOLD:
             return None
-        back_dist = obstacle_distances.get("back", 10.0)
-        if back_dist < ROTATE_REJECT_DISTANCE:
-            logger.warning("Stuck but can't escape — back blocked at %.2fm", back_dist)
-            self._consecutive_blocked = 0  # reset to avoid infinite loop
-            return None
-        self._consecutive_blocked = 0
-        self.blocked_memory.clear()
-        logger.warning(
-            "STUCK ESCAPE: %d consecutive blocks — backing up (%.1fm clear behind)",
-            STUCK_ESCAPE_THRESHOLD, back_dist)
+        direction = self.find_best_escape_direction(obstacle_distances)
+        if direction is not None:
+            self._consecutive_blocked = 0
+            self.blocked_memory.clear()
+            logger.warning(
+                "STUCK ESCAPE: %d consecutive blocks — escaping toward %s",
+                STUCK_ESCAPE_THRESHOLD, direction)
+            return self._escape_target_for_direction(direction)
+        # Cornered — all directions blocked. Do NOT reset _consecutive_blocked
+        # so stuck detector can escalate to Tier 3 (help request).
+        logger.warning("STUCK ESCAPE: cornered — all directions blocked")
+        return None
+
+    def _escape_target_for_direction(self, direction):
+        """Map an escape direction to a VelocityTarget ExecutionResult."""
         twist = Twist()
-        twist.linear.x = -0.08
+        if direction == "backward":
+            twist.linear.x = -0.08
+            duration = 2.0
+        elif direction == "forward":
+            twist.linear.x = float(ACKERMAN_MIN_LINEAR)
+            duration = 2.0
+        else:
+            # Rotation escapes: map direction to degrees then use arc turn
+            deg_map = {
+                "forward_left": -45,
+                "forward_right": 45,
+                "left": -90,
+                "right": 90,
+            }
+            degrees = deg_map.get(direction, 90)
+            duration = max(0.5, min(6.0, math.radians(abs(degrees)) / ACKERMAN_ANGULAR_SPEED))
+            twist.linear.x = float(ACKERMAN_MIN_LINEAR)
+            twist.angular.z = float(
+                ACKERMAN_ANGULAR_SPEED if degrees < 0 else -ACKERMAN_ANGULAR_SPEED)
+
         return ExecutionResult(
             success=True,
-            target=VelocityTarget(twist=twist, duration_s=2.0),
+            target=VelocityTarget(twist=twist, duration_s=duration),
             safety_override=True,
-            safety_message=f"Auto-escape: backed up to clear obstacle")
+            safety_message=f"Auto-escape: {direction}")
+
+    # -- Public escape helpers (Plan 008, Task 1.2) --
+
+    def find_best_escape_direction(self, obstacle_distances):
+        """Return the best passable escape direction, or None if all blocked.
+
+        Ranks directions by affordance score (descending), then pre-validates
+        each through _pre_validate() with a synthetic NavigationDecision.
+        """
+        scores = compute_affordance_scores(obstacle_distances)
+        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        for direction, score in ranked:
+            if self.validate_direction(direction, obstacle_distances):
+                return direction
+        return None
+
+    def validate_direction(self, direction, obstacle_distances):
+        """Check whether a single direction passes pre-validation."""
+        now = time.time()
+        if direction == "backward":
+            synthetic = NavigationDecision(
+                tool_name="move_toward",
+                parameters={"direction": "backward", "speed": "slow", "duration_s": 2.0},
+                reasoning="escape", timestamp=now,
+            )
+        elif direction in ("left", "right"):
+            deg = -90 if direction == "left" else 90
+            synthetic = NavigationDecision(
+                tool_name="rotate",
+                parameters={"degrees": deg},
+                reasoning="escape", timestamp=now,
+            )
+        else:
+            synthetic = NavigationDecision(
+                tool_name="move_toward",
+                parameters={"direction": direction, "speed": "slow", "duration_s": 2.0},
+                reasoning="escape", timestamp=now,
+            )
+        valid, _, _ = self._pre_validate(synthetic, obstacle_distances)
+        return valid
+
+    def reset_stuck_state(self):
+        """Zero _consecutive_blocked and clear blocked memory.
+
+        Called by voice_mapper when stuck detector transitions from stuck
+        back to None (robot moving again after recovery).
+        """
+        self._consecutive_blocked = 0
+        self.blocked_memory.clear()
 
     # -- Pre-validation (Task 3.4) --
 

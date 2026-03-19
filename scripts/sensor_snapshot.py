@@ -105,7 +105,8 @@ CARDINAL_DIRECTIONS = [
 # Standalone Functions
 # ---------------------------------------------------------------------------
 
-def annotate_image(image_msg, depth_msg, heading_deg, heading_cardinal, bridge):
+def annotate_image(image_msg, depth_msg, heading_deg, heading_cardinal, bridge,
+                    obstacle_distances=None):
     """Overlay 7 depth values and heading arrow on 640x480 RGB.
 
     Returns base64-encoded JPEG string, or None on failure.
@@ -149,6 +150,26 @@ def annotate_image(image_msg, depth_msg, heading_deg, heading_cardinal, bridge):
         _draw_outlined_text(cv_image, heading_cardinal, (arrow_cx - 15, arrow_cy + 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                             (0, 255, 0), (0, 0, 0))
+
+        # --- Clearance legend bar at bottom ---
+        if obstacle_distances:
+            bar_y = 460
+            bar_x = 10
+            directions = ["F", "FL", "FR", "L", "R", "B"]
+            keys = ["front", "front_left", "front_right", "left", "right", "back"]
+            for i, (label, key) in enumerate(zip(directions, keys)):
+                dist = obstacle_distances.get(key, 10.0)
+                if dist < 0.5:
+                    color = (0, 0, 200)    # Red (BGR) — blocked
+                elif dist < 1.0:
+                    color = (0, 200, 200)  # Yellow — restricted
+                else:
+                    color = (0, 180, 0)    # Green — clear
+                x = bar_x + i * 100
+                cv2.rectangle(cv_image, (x, bar_y), (x + 90, bar_y + 18), color, -1)
+                text = f"{label}:{dist:.1f}m"
+                cv2.putText(cv_image, text, (x + 4, bar_y + 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
         # --- Encode to base64 JPEG ---
         _, buffer = cv2.imencode('.jpg', cv_image, [cv2.IMWRITE_JPEG_QUALITY, 80])
@@ -213,7 +234,9 @@ def build_lidar_summary(ranges, angle_min, angle_inc):
 
 
 def compute_affordance_scores(obstacle_distances):
-    """Map 6 navigation directions to feasibility scores (0.1–1.0) from LiDAR."""
+    """Map 6 navigation directions to feasibility scores (0.0–1.0; 0.0 when no LiDAR data)."""
+    if not obstacle_distances:
+        return {d: 0.0 for d in AFFORDANCE_DIRECTIONS}
     scores = {}
     for direction, obs_key in AFFORDANCE_DIRECTIONS.items():
         dist = obstacle_distances.get(obs_key, 10.0)
@@ -441,7 +464,8 @@ class SensorSnapshotBuilder:
         annotated_b64 = annotate_image(
             vm.latest_image, vm.latest_depth,
             heading_deg, heading_cardinal,
-            self._bridge
+            self._bridge,
+            obstacle_distances=getattr(vm, 'obstacle_distances', None)
         )
         if annotated_b64 is None:
             logger.warning("No annotated image — camera or depth unavailable")

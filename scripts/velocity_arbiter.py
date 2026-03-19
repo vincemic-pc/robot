@@ -346,8 +346,10 @@ class SafetyFilter:
             result.linear.x = 0.0
             return result, state
 
-        # Rear obstacle check: block reverse if back < min_distance
-        if linear < 0 and back_dist < self.min_distance:
+        # Rear obstacle check: backward uses emergency threshold (0.3m) —
+        # safety executor pre-validates at 0.5m for normal moves; this allows
+        # escape maneuvers approved at 0.3m to execute.
+        if linear < 0 and back_dist < self.emergency_distance:
             state.stopped = True
             state.reason = f"obstacle_back_{back_dist:.2f}m"
             result.linear.x = 0.0

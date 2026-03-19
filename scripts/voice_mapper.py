@@ -73,7 +73,7 @@ from sensor_snapshot import (
 )
 from llm_navigator import LLMNavigator, NavigationDecision
 from safety_executor import (
-    SafetyExecutor, VelocityTarget, NavGoalTarget, ObserveTarget, StopTarget,
+    SafetyExecutor, StuckDetector, VelocityTarget, NavGoalTarget, ObserveTarget, StopTarget,
 )
 from exploration_memory import ExplorationMemory
 
@@ -426,6 +426,15 @@ class VoiceMapper(Node):
         self._vlm_triggered_calls = 0
         self._vlm_skipped_calls = 0
         self._vlm_metrics_start = 0.0
+
+        # Stuck detection (Plan 008)
+        self._stuck_detector = StuckDetector()
+        self._stuck_state = None        # Current stuck tier or None
+        self._last_stuck_tier = None    # For one-shot tier dispatch
+        self._prev_pos_source = None    # Track VSLAM/wheel source switches
+        self._camera_monitor_suppress_until = 0.0  # Grace period for SLAM startup
+        self._last_move_distance = None   # Actual distance from last movement (Plan 008)
+        self._pre_move_pos = None         # Position before movement execution
 
         self.get_logger().info("Voice Mapper initialized!")
 
@@ -1418,6 +1427,8 @@ If the object is not visible, set found to false. Only respond with valid JSON."
             )
             
             self.mapping = True
+            self._camera_monitor_suppress_until = time.time() + 10.0
+            self.get_logger().info("Camera monitor suppressed for 10s during SLAM startup")
             time.sleep(3)  # Give SLAM time to start
             
             self.get_logger().info("✅ SLAM started!")
@@ -2385,8 +2396,9 @@ Status:
                 if self.llm_nav_paused.is_set():
                     break
                 elapsed = time.time() - last_call_time
-                # Base interval fallback
-                if elapsed >= base_interval:
+                # Reduce interval to 3s when stuck (Plan 008, Task 3.1)
+                effective_interval = 3.0 if self._stuck_state else base_interval
+                if elapsed >= effective_interval:
                     break
                 # Check event triggers
                 trigger_reasons = self._event_trigger.check_triggers(
@@ -2593,6 +2605,9 @@ Status:
             # Check for new VLM decision in queue
             try:
                 decision = self.vlm_decision_queue.get_nowait()
+                # Record position before execution (Plan 008, Task 3.2)
+                self._pre_move_pos = (self.current_position['x'],
+                                      self.current_position['y'])
                 result = self.safety_executor.execute_decision(
                     decision, self, self.exploration_memory)
 
@@ -2603,10 +2618,16 @@ Status:
                     'success': result.success,
                     'safety_override': result.safety_override,
                     'safety_message': result.safety_message,
+                    'actual_distance_m': self._last_move_distance,
+                    'stopped_reason': result.stopped_reason,
                 }
+                self._last_move_distance = None
                 if result.check_result:
                     action_result['check_result'] = result.check_result
                 self.snapshot_builder.set_previous_action_result(action_result)
+
+                if result.success:
+                    self.safety_executor.watchdog.feed_success()
 
                 # Update exploration memory with result
                 pos = self.current_position
@@ -2656,6 +2677,14 @@ Status:
                     self._publish_velocity_request(
                         0, 0, VelocityRequest.PRIORITY_EXPLORATION,
                         "llm_target_expired", duration_s=0.2)
+                    # Compute actual distance traveled (Plan 008, Task 3.2)
+                    if self._pre_move_pos is not None:
+                        post_x = self.current_position['x']
+                        post_y = self.current_position['y']
+                        self._last_move_distance = math.hypot(
+                            post_x - self._pre_move_pos[0],
+                            post_y - self._pre_move_pos[1])
+                        self._pre_move_pos = None
                     self._current_target = None
 
             elif isinstance(self._current_target, NavGoalTarget):
@@ -2667,6 +2696,56 @@ Status:
                 self._publish_velocity_request(
                     0, 0, VelocityRequest.PRIORITY_EXPLORATION, "llm_stop",
                     duration_s=0.2)
+
+            # --- Stuck detector (Plan 008, Task 1.5/1.9) ---
+            # Select position source: VSLAM if tracking and fresh, else wheel odom
+            if (self.vslam_tracking
+                    and self.vslam_pose is not None
+                    and (time.time() - self.vslam_last_odom_time) < 2.0):
+                pos_x = self.vslam_pose.position.x
+                pos_y = self.vslam_pose.position.y
+                pos_source = "vslam"
+            else:
+                pos_x = self.current_position['x']
+                pos_y = self.current_position['y']
+                pos_source = "wheel"
+
+            # Source switch → reset to avoid false displacement spike
+            if self._prev_pos_source is not None and pos_source != self._prev_pos_source:
+                self._stuck_detector.reset()
+                self.get_logger().info(
+                    "Stuck detector reset: position source changed %s→%s",
+                    self._prev_pos_source, pos_source)
+            self._prev_pos_source = pos_source
+
+            # Suspend/resume based on current state
+            if isinstance(self._current_target, NavGoalTarget) or self._observing:
+                self._stuck_detector.suspend()
+            else:
+                self._stuck_detector.resume()
+
+            # Update stuck detector
+            stuck_tier = self._stuck_detector.update(pos_x, pos_y)
+            self._stuck_state = stuck_tier
+
+            # Tier dispatch — only fire once per tier level
+            if stuck_tier and stuck_tier != self._last_stuck_tier:
+                if stuck_tier == "TIER1":
+                    self._execute_tier1_escape()
+                elif stuck_tier == "TIER2":
+                    self._execute_tier2_escape()
+                elif stuck_tier == "TIER3":
+                    self._execute_tier3_help()
+                self._last_stuck_tier = stuck_tier
+
+            # Stuck-clear transition: robot moved again after recovery
+            if stuck_tier is None and self._last_stuck_tier is not None:
+                self.get_logger().info(
+                    "Stuck cleared (was %s) — resetting detector and executor",
+                    self._last_stuck_tier)
+                self._last_stuck_tier = None
+                self._stuck_detector.reset()
+                self.safety_executor.reset_stuck_state()
 
             # Watchdog check
             tier = self.safety_executor.watchdog.evaluate()
@@ -2711,6 +2790,51 @@ Status:
             target=self.exploration_loop, daemon=True)
         self.explore_thread.start()
 
+    # --- Stuck recovery tiers (Plan 008, Tasks 1.6-1.8) ---
+
+    def _execute_tier1_escape(self):
+        """Tier 1: Rotate toward the highest-affordance direction."""
+        direction = self.safety_executor.find_best_escape_direction(
+            self.obstacle_distances)
+        if direction is None:
+            self.get_logger().warning(
+                "STUCK TIER1: no passable direction found — waiting for Tier 2")
+            return
+        # Build rotation toward best direction
+        result = self.safety_executor._escape_target_for_direction(direction)
+        self._current_target = result.target
+        self._target_start_time = time.time()
+        self._vlm_trigger_event.set()
+        self.get_logger().warning("STUCK TIER1: rotating toward %s", direction)
+
+    def _execute_tier2_escape(self):
+        """Tier 2: Try all passable directions (affordance-ranked) with probe moves."""
+        from sensor_snapshot import compute_affordance_scores
+        scores = compute_affordance_scores(self.obstacle_distances)
+        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+
+        for direction, score in ranked:
+            if self.safety_executor.validate_direction(
+                    direction, self.obstacle_distances):
+                result = self.safety_executor._escape_target_for_direction(direction)
+                self._current_target = result.target
+                self._target_start_time = time.time()
+                self._vlm_trigger_event.set()
+                self.get_logger().warning(
+                    "STUCK TIER2: probing %s (affordance=%.2f)", direction, score)
+                return
+
+        self.get_logger().error(
+            "STUCK TIER2: all directions blocked — waiting for Tier 3")
+
+    def _execute_tier3_help(self):
+        """Tier 3: Stop and request human help. Do NOT stop exploration."""
+        self._publish_velocity_request(
+            0, 0, VelocityRequest.PRIORITY_SAFETY, "stuck_tier3",
+            duration_s=1.0)
+        self.speak("I'm stuck and can't find a way out. Please help me.")
+        self.get_logger().error("STUCK TIER3: requesting human help")
+
     def start_llm_exploration(self):
         """Start LLM-driven autonomous exploration (VLM decision + control loops)."""
         if self.llm_exploring:
@@ -2732,9 +2856,14 @@ Status:
         pos = self.current_position
         self.exploration_memory = ExplorationMemory(pos['x'], pos['y'])
 
-        # Clear watchdog / blocked memory / event triggers
+        # Clear watchdog / blocked memory / event triggers / stuck detector
         self.safety_executor.watchdog.feed()
         self.safety_executor.blocked_memory.clear()
+        self.safety_executor.reset_stuck_state()
+        self._stuck_detector.reset()
+        self._stuck_state = None
+        self._last_stuck_tier = None
+        self._prev_pos_source = None
         self._event_trigger.reset()
         self._vlm_trigger_event.clear()
 
@@ -3223,7 +3352,7 @@ Status:
                         self.beep("success")
                         self.start_exploration()
                 image_warned = False
-            elif now - last_image_time > CAMERA_LOSS_TIMEOUT and not camera_lost:
+            elif now - last_image_time > CAMERA_LOSS_TIMEOUT and not camera_lost and time.time() >= self._camera_monitor_suppress_until:
                 camera_lost = True
                 self.get_logger().error(f"Camera data lost! No frames for {CAMERA_LOSS_TIMEOUT:.0f}s")
                 self.beep("error")
